@@ -32,58 +32,114 @@ function withAdminHeaders(token, headers = {}) {
   };
 }
 
+function withStudentHeaders(token, headers = {}) {
+  return {
+    Authorization: `Bearer ${token}`,
+    ...headers,
+  };
+}
+
 export function fetchMeta() {
   return apiRequest('/api/exam/meta');
 }
 
-export function startSession(data) {
+export function studentLogin(payload) {
+  return apiRequest('/api/student/login', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function fetchStudentMe(token) {
+  return apiRequest('/api/student/me', {
+    headers: withStudentHeaders(token),
+  });
+}
+
+export function changeStudentPassword(token, payload) {
+  return apiRequest('/api/student/change-password', {
+    method: 'POST',
+    headers: withStudentHeaders(token),
+    body: JSON.stringify(payload),
+  });
+}
+
+export function requestStudentPasswordHelp(payload) {
+  return apiRequest('/api/student/password-help', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function fetchStudentTrials(token) {
+  return apiRequest('/api/student/trials', {
+    headers: withStudentHeaders(token),
+  });
+}
+
+export function fetchStudentTrial(token, sessionId) {
+  return apiRequest(`/api/student/trials/${encodeURIComponent(sessionId)}`, {
+    headers: withStudentHeaders(token),
+  });
+}
+
+export function startSession(token, data) {
   return apiRequest('/api/exam/start', {
     method: 'POST',
+    headers: withStudentHeaders(token),
     body: JSON.stringify(data),
   });
 }
 
-export function fetchSession(sessionId) {
-  return apiRequest(`/api/exam/${sessionId}`);
+export function fetchSession(token, sessionId) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}`, {
+    headers: withStudentHeaders(token),
+  });
 }
 
-export function markSeen(sessionId, questionId) {
-  return apiRequest(`/api/exam/${sessionId}/seen`, {
+export function markSeen(token, sessionId, questionId) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/seen`, {
     method: 'POST',
+    headers: withStudentHeaders(token),
     body: JSON.stringify({ questionId }),
   });
 }
 
-export function saveAnswer(sessionId, questionId, selectedOptionIds) {
-  return apiRequest(`/api/exam/${sessionId}/answer`, {
+export function saveAnswer(token, sessionId, questionId, selectedOptionIds) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/answer`, {
     method: 'POST',
+    headers: withStudentHeaders(token),
     body: JSON.stringify({ questionId, selectedOptionIds }),
   });
 }
 
-export function saveFlag(sessionId, questionId, flagged) {
-  return apiRequest(`/api/exam/${sessionId}/flag`, {
+export function saveFlag(token, sessionId, questionId, flagged) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/flag`, {
     method: 'POST',
+    headers: withStudentHeaders(token),
     body: JSON.stringify({ questionId, flagged }),
   });
 }
 
-export function logViolation(sessionId, type, detail) {
-  return apiRequest(`/api/exam/${sessionId}/proctor`, {
+export function logViolation(token, sessionId, type, detail) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/proctor`, {
     method: 'POST',
+    headers: withStudentHeaders(token),
     body: JSON.stringify({ type, detail }),
   });
 }
 
-export function submitExam(sessionId) {
-  return apiRequest(`/api/exam/${sessionId}/submit`, {
+export function submitExam(token, sessionId) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/submit`, {
     method: 'POST',
+    headers: withStudentHeaders(token),
   });
 }
 
-export function saveExamFeedback(sessionId, payload) {
-  return apiRequest(`/api/exam/${sessionId}/feedback`, {
+export function saveExamFeedback(token, sessionId, payload) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/feedback`, {
     method: 'POST',
+    headers: withStudentHeaders(token),
     body: JSON.stringify(payload),
   });
 }
@@ -101,7 +157,75 @@ export function fetchAdminOverview(token) {
   });
 }
 
-export function fetchAdminSessions(token, { search = '', classRoom = '', status = '' } = {}) {
+export function fetchAdminSessions(
+  token,
+  { search = '', classRoom = '', status = '', examId = '' } = {}
+) {
+  const params = new URLSearchParams();
+  if (search) {
+    params.set('search', search);
+  }
+  if (classRoom) {
+    params.set('classRoom', classRoom);
+  }
+  if (status) {
+    params.set('status', status);
+  }
+  if (examId) {
+    params.set('examId', examId);
+  }
+
+  const queryString = params.toString();
+  return apiRequest(`/api/admin/sessions${queryString ? `?${queryString}` : ''}`, {
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function fetchAdminSession(token, sessionId) {
+  return apiRequest(`/api/admin/sessions/${encodeURIComponent(sessionId)}`, {
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function waiveAdminSessionViolations(token, sessionId, payload) {
+  return apiRequest(`/api/admin/sessions/${encodeURIComponent(sessionId)}/violations/waive`, {
+    method: 'PATCH',
+    headers: withAdminHeaders(token),
+    body: JSON.stringify(payload),
+  });
+}
+
+export function fetchAdminStudents(
+  token,
+  { search = '', classRoom = '', examId = '' } = {}
+) {
+  const params = new URLSearchParams();
+  if (search) {
+    params.set('search', search);
+  }
+  if (classRoom) {
+    params.set('classRoom', classRoom);
+  }
+  if (examId) {
+    params.set('examId', examId);
+  }
+
+  const queryString = params.toString();
+  return apiRequest(`/api/admin/students${queryString ? `?${queryString}` : ''}`, {
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function fetchAdminStudentTrials(token, studentKey) {
+  return apiRequest(`/api/admin/students/${encodeURIComponent(studentKey)}/trials`, {
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function fetchAdminUsers(
+  token,
+  { search = '', classRoom = '', status = '' } = {}
+) {
   const params = new URLSearchParams();
   if (search) {
     params.set('search', search);
@@ -114,8 +238,74 @@ export function fetchAdminSessions(token, { search = '', classRoom = '', status 
   }
 
   const queryString = params.toString();
-  return apiRequest(`/api/admin/sessions${queryString ? `?${queryString}` : ''}`, {
+  return apiRequest(`/api/admin/users${queryString ? `?${queryString}` : ''}`, {
     headers: withAdminHeaders(token),
+  });
+}
+
+export function updateAdminUser(token, userId, payload) {
+  return apiRequest(`/api/admin/users/${encodeURIComponent(userId)}`, {
+    method: 'PATCH',
+    headers: withAdminHeaders(token),
+    body: JSON.stringify(payload),
+  });
+}
+
+export function resetAdminUserPassword(token, userId, payload) {
+  return apiRequest(`/api/admin/users/${encodeURIComponent(userId)}/password`, {
+    method: 'POST',
+    headers: withAdminHeaders(token),
+    body: JSON.stringify(payload),
+  });
+}
+
+export function fetchAdminPasswordHelp(token, { search = '', status = 'open' } = {}) {
+  const params = new URLSearchParams();
+  if (search) {
+    params.set('search', search);
+  }
+  if (status) {
+    params.set('status', status);
+  }
+
+  const queryString = params.toString();
+  return apiRequest(`/api/admin/password-help${queryString ? `?${queryString}` : ''}`, {
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function resolveAdminPasswordHelp(token, requestId) {
+  return apiRequest(`/api/admin/password-help/${encodeURIComponent(requestId)}/resolve`, {
+    method: 'PATCH',
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function fetchAdminExams(token) {
+  return apiRequest('/api/admin/exams', {
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function fetchAdminExam(token, examId) {
+  return apiRequest(`/api/admin/exams/${encodeURIComponent(examId)}`, {
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function createAdminExam(token, payload) {
+  return apiRequest('/api/admin/exams', {
+    method: 'POST',
+    headers: withAdminHeaders(token),
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateAdminExam(token, examId, payload) {
+  return apiRequest(`/api/admin/exams/${encodeURIComponent(examId)}`, {
+    method: 'PATCH',
+    headers: withAdminHeaders(token),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -126,7 +316,7 @@ export function fetchAdminQuestions(token) {
 }
 
 export function deleteAdminSession(token, sessionId) {
-  return apiRequest(`/api/admin/sessions/${sessionId}`, {
+  return apiRequest(`/api/admin/sessions/${encodeURIComponent(sessionId)}`, {
     method: 'DELETE',
     headers: withAdminHeaders(token),
   });

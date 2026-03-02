@@ -1,14 +1,8 @@
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
-
 import { DEFAULT_QUESTION_BANK } from './questions.js';
+import { getCollection } from './db.js';
 
-const STORE_DIR = path.resolve(process.cwd(), 'server', 'data');
-const STORE_FILE = path.join(STORE_DIR, 'questions.json');
-
-let questionPool = [];
+const COLLECTION_NAME = 'questions';
 let initialized = false;
-let writeQueue = Promise.resolve();
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -18,14 +12,22 @@ function normalizeText(value) {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
 }
 
+function normalizeExamId(value) {
+  return normalizeText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 function extractNumericId(questionId) {
   const match = /^Q(\d+)$/i.exec(questionId ?? '');
   return match ? Number(match[1]) : 0;
 }
 
-function getNextQuestionId() {
-  const maxId = questionPool.reduce((max, question) => {
-    const parsed = extractNumericId(question.id);
+async function getNextQuestionId(collection) {
+  const all = await collection.find({}, { projection: { id: 1 } }).toArray();
+  const maxId = all.reduce((max, item) => {
+    const parsed = extractNumericId(item.id);
     return parsed > max ? parsed : max;
   }, 0);
 
@@ -51,7 +53,7 @@ function sanitizeCorrectOptionIds(correctOptionIds) {
   );
 }
 
-function validateQuestion(question) {
+function validateQuestion(question, generatedId = '') {
   if (!question || typeof question !== 'object') {
     throw new Error('Invalid question payload.');
   }
@@ -89,24 +91,31 @@ function validateQuestion(question) {
     throw new Error('Single-choice question must have exactly one correct option.');
   }
 
-  const id = normalizeText(question.id) || getNextQuestionId();
+  const id = normalizeText(question.id) || generatedId;
+  if (!/^Q\d{3,}$/i.test(id)) {
+    throw new Error('Question ID must look like Q001.');
+  }
+
+  const sourceExamId = normalizeExamId(question.sourceExamId) || 'general';
 
   return {
-    id,
+    id: id.toUpperCase(),
     topic,
     type,
     text,
     options,
     correctOptionIds,
+    sourceExamId,
   };
 }
 
-async function persist() {
-  writeQueue = writeQueue.then(() =>
-    fs.writeFile(STORE_FILE, JSON.stringify({ questions: questionPool }, null, 2), 'utf8')
-  );
+function stripMongoId(value) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
 
-  await writeQueue;
+  const { _id: _ignoredId, ...rest } = value;
+  return rest;
 }
 
 async function ensureInitialized() {
@@ -114,24 +123,19 @@ async function ensureInitialized() {
     return;
   }
 
-  await fs.mkdir(STORE_DIR, { recursive: true });
+  const collection = await getCollection(COLLECTION_NAME);
+  await collection.createIndex({ id: 1 }, { unique: true, name: 'idx_question_id' });
+  await collection.createIndex({ sourceExamId: 1 }, { name: 'idx_question_source_exam_id' });
 
-  try {
-    const existing = await fs.readFile(STORE_FILE, 'utf8');
-    const parsed = JSON.parse(existing);
-    if (Array.isArray(parsed?.questions) && parsed.questions.length > 0) {
-      questionPool = parsed.questions.map((item) => validateQuestion(item));
-    } else {
-      questionPool = DEFAULT_QUESTION_BANK.map((item) => validateQuestion(item));
-      await persist();
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      throw error;
-    }
+  const count = await collection.estimatedDocumentCount();
+  if (count === 0) {
+    const defaults = DEFAULT_QUESTION_BANK.map((item) =>
+      validateQuestion({ ...item, sourceExamId: item.sourceExamId ?? 'general' }, item.id)
+    );
 
-    questionPool = DEFAULT_QUESTION_BANK.map((item) => validateQuestion(item));
-    await persist();
+    if (defaults.length > 0) {
+      await collection.insertMany(defaults);
+    }
   }
 
   initialized = true;
@@ -139,24 +143,31 @@ async function ensureInitialized() {
 
 export async function getQuestionPool() {
   await ensureInitialized();
-  return clone(questionPool);
+  const collection = await getCollection(COLLECTION_NAME);
+  const questions = await collection.find({}).toArray();
+  return questions.map((item) => clone(stripMongoId(item)));
 }
 
 export async function getQuestionByIdMap() {
   await ensureInitialized();
-  return new Map(questionPool.map((question) => [question.id, clone(question)]));
+  const collection = await getCollection(COLLECTION_NAME);
+  const questions = await collection.find({}).toArray();
+  return new Map(questions.map((question) => [question.id, clone(stripMongoId(question))]));
 }
 
 export async function addQuestion(payload) {
   await ensureInitialized();
+  const collection = await getCollection(COLLECTION_NAME);
 
-  const nextQuestion = validateQuestion(payload);
-  if (questionPool.some((question) => question.id === nextQuestion.id)) {
+  const generatedId = normalizeText(payload?.id) || (await getNextQuestionId(collection));
+  const nextQuestion = validateQuestion(payload, generatedId);
+
+  const existing = await collection.findOne({ id: nextQuestion.id });
+  if (existing) {
     throw new Error('Question ID already exists.');
   }
 
-  questionPool.push(nextQuestion);
-  await persist();
+  await collection.insertOne(nextQuestion);
   return clone(nextQuestion);
 }
 
@@ -167,14 +178,16 @@ export async function replaceQuestionPool(nextQuestions) {
     throw new Error('Question pool cannot be empty.');
   }
 
-  const sanitized = nextQuestions.map((question) => validateQuestion(question));
+  const sanitized = nextQuestions.map((question) => validateQuestion(question, question.id));
   const idSet = new Set(sanitized.map((question) => question.id));
 
   if (idSet.size !== sanitized.length) {
     throw new Error('Question IDs must be unique.');
   }
 
-  questionPool = sanitized;
-  await persist();
-  return clone(questionPool);
+  const collection = await getCollection(COLLECTION_NAME);
+  await collection.deleteMany({});
+  await collection.insertMany(sanitized);
+
+  return clone(sanitized);
 }

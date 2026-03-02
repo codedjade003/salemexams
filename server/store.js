@@ -1,86 +1,80 @@
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
+import { getCollection } from './db.js';
 
-const STORE_DIR = path.resolve(process.cwd(), 'server', 'data');
-const STORE_FILE = path.join(STORE_DIR, 'sessions.json');
-
-let db = { sessions: {} };
+const COLLECTION_NAME = 'sessions';
 let initialized = false;
-let writeQueue = Promise.resolve();
+
+function stripMongoId(value) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  const { _id: _ignoredId, ...rest } = value;
+  return rest;
+}
 
 async function ensureInitialized() {
   if (initialized) {
     return;
   }
 
-  await fs.mkdir(STORE_DIR, { recursive: true });
-
-  try {
-    const existing = await fs.readFile(STORE_FILE, 'utf8');
-    const parsed = JSON.parse(existing);
-    if (parsed && typeof parsed === 'object' && parsed.sessions) {
-      db = parsed;
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      throw error;
-    }
-    await fs.writeFile(STORE_FILE, JSON.stringify(db, null, 2), 'utf8');
-  }
+  const collection = await getCollection(COLLECTION_NAME);
+  await collection.createIndex({ id: 1 }, { unique: true, name: 'idx_session_id' });
+  await collection.createIndex({ studentKey: 1 }, { name: 'idx_session_student_key' });
+  await collection.createIndex({ examId: 1 }, { name: 'idx_session_exam_id' });
+  await collection.createIndex({ startedAt: -1 }, { name: 'idx_session_started_at' });
 
   initialized = true;
 }
 
-function persist() {
-  writeQueue = writeQueue.then(() =>
-    fs.writeFile(STORE_FILE, JSON.stringify(db, null, 2), 'utf8')
-  );
-  return writeQueue;
-}
-
 export async function getSession(sessionId) {
   await ensureInitialized();
-  return db.sessions[sessionId] ?? null;
+  const collection = await getCollection(COLLECTION_NAME);
+  const session = await collection.findOne({ id: sessionId });
+  return session ? stripMongoId(session) : null;
 }
 
 export async function listSessions() {
   await ensureInitialized();
-  return Object.values(db.sessions);
+  const collection = await getCollection(COLLECTION_NAME);
+  const sessions = await collection.find({}).toArray();
+  return sessions.map(stripMongoId);
 }
 
 export async function saveSession(session) {
   await ensureInitialized();
-  db.sessions[session.id] = session;
-  await persist();
+  const collection = await getCollection(COLLECTION_NAME);
+
+  await collection.replaceOne(
+    { id: session.id },
+    { ...session },
+    { upsert: true }
+  );
+
   return session;
 }
 
 export async function updateSession(sessionId, updater) {
   await ensureInitialized();
-  const existing = db.sessions[sessionId];
+  const collection = await getCollection(COLLECTION_NAME);
+  const existing = await collection.findOne({ id: sessionId });
   if (!existing) {
     return null;
   }
 
-  const nextValue = updater(existing);
+  const nextValue = updater(stripMongoId(existing));
   if (!nextValue) {
     return null;
   }
 
-  db.sessions[sessionId] = nextValue;
-  await persist();
+  await collection.replaceOne({ id: sessionId }, { ...nextValue }, { upsert: false });
   return nextValue;
 }
 
 export async function deleteSession(sessionId) {
   await ensureInitialized();
-  if (!db.sessions[sessionId]) {
-    return false;
-  }
-
-  delete db.sessions[sessionId];
-  await persist();
-  return true;
+  const collection = await getCollection(COLLECTION_NAME);
+  const result = await collection.deleteOne({ id: sessionId });
+  return result.deletedCount > 0;
 }
 
 export async function deleteSessions(sessionIds) {
@@ -89,17 +83,7 @@ export async function deleteSessions(sessionIds) {
     return 0;
   }
 
-  let deletedCount = 0;
-  for (const sessionId of sessionIds) {
-    if (db.sessions[sessionId]) {
-      delete db.sessions[sessionId];
-      deletedCount += 1;
-    }
-  }
-
-  if (deletedCount > 0) {
-    await persist();
-  }
-
-  return deletedCount;
+  const collection = await getCollection(COLLECTION_NAME);
+  const result = await collection.deleteMany({ id: { $in: sessionIds } });
+  return result.deletedCount ?? 0;
 }

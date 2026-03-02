@@ -2,15 +2,26 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import {
   adminLogin,
+  createAdminExam,
   createAdminQuestion,
   deleteAdminSession,
   deleteAdminSessions,
   downloadAdminExport,
+  fetchAdminExams,
+  fetchAdminPasswordHelp,
+  fetchAdminStudentTrials,
+  fetchAdminStudents,
   fetchAdminOverview,
   fetchAdminQuestions,
   fetchAdminSessions,
+  fetchAdminUsers,
   fetchMeta,
   purgeAdminSessions,
+  resetAdminUserPassword,
+  resolveAdminPasswordHelp,
+  updateAdminUser,
+  updateAdminExam,
+  waiveAdminSessionViolations,
 } from './api';
 
 const ADMIN_TOKEN_KEY = 'salem_admin_token';
@@ -25,8 +36,14 @@ const DEFAULT_WIDGETS = {
   violationTypes: true,
   classPerformance: true,
   recentSubmissions: true,
+  outstandingStudents: true,
+  classLeaderboards: true,
   exportCenter: true,
   candidateSessions: true,
+  studentTrials: true,
+  userManager: true,
+  passwordHelp: true,
+  examManager: true,
   questionManager: true,
 };
 
@@ -36,6 +53,8 @@ const ANALYTICS_WIDGET_KEYS = [
   'violationTypes',
   'classPerformance',
   'recentSubmissions',
+  'outstandingStudents',
+  'classLeaderboards',
 ];
 
 const CORE_WIDGET_PRESET = {
@@ -44,8 +63,14 @@ const CORE_WIDGET_PRESET = {
   violationTypes: false,
   classPerformance: true,
   recentSubmissions: true,
+  outstandingStudents: true,
+  classLeaderboards: false,
   exportCenter: true,
   candidateSessions: true,
+  studentTrials: true,
+  userManager: true,
+  passwordHelp: true,
+  examManager: true,
   questionManager: false,
 };
 
@@ -55,8 +80,14 @@ const WIDGET_LABELS = {
   violationTypes: 'Violation types',
   classPerformance: 'Class performance',
   recentSubmissions: 'Recent submissions',
+  outstandingStudents: 'Outstanding students',
+  classLeaderboards: 'Class leaderboards',
   exportCenter: 'Export center',
   candidateSessions: 'Candidate sessions',
+  studentTrials: 'Student trials',
+  userManager: 'User manager',
+  passwordHelp: 'Password help',
+  examManager: 'Exam manager',
   questionManager: 'Question manager',
 };
 
@@ -68,6 +99,31 @@ const PURGE_LABELS = {
 };
 
 const EMPTY_QUESTION_FORM = {
+  topic: 'general',
+  type: 'single',
+  text: '',
+  optionA: '',
+  optionB: '',
+  optionC: '',
+  optionD: '',
+  correctA: true,
+  correctB: false,
+  correctC: false,
+  correctD: false,
+};
+
+const EMPTY_EXAM_FORM = {
+  id: '',
+  title: '',
+  description: '',
+  durationSeconds: 1500,
+  maxAttempts: 3,
+  questionCount: 40,
+  published: true,
+  allowedClasses: [],
+};
+
+const EMPTY_EXAM_QUESTION_FORM = {
   topic: 'general',
   type: 'single',
   text: '',
@@ -130,17 +186,46 @@ function AdminPage() {
   const [overview, setOverview] = useState(null);
   const [sessions, setSessions] = useState([]);
   const [questions, setQuestions] = useState([]);
+  const [exams, setExams] = useState([]);
+  const [students, setStudents] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [passwordHelpRequests, setPasswordHelpRequests] = useState([]);
+  const [studentTrials, setStudentTrials] = useState(null);
+  const [studentTrialLoading, setStudentTrialLoading] = useState(false);
+  const [trialReviewOpen, setTrialReviewOpen] = useState(false);
+  const [trialSelectedViolations, setTrialSelectedViolations] = useState({});
 
-  const [filters, setFilters] = useState({ search: '', classRoom: '', status: '' });
+  const [filters, setFilters] = useState({ search: '', classRoom: '', status: '', examId: '' });
+  const [studentFilters, setStudentFilters] = useState({ search: '', classRoom: '', examId: '' });
+  const [userFilters, setUserFilters] = useState({ search: '', classRoom: '', status: '' });
+  const [helpFilters, setHelpFilters] = useState({ search: '', status: 'open' });
+  const [userPasswordDrafts, setUserPasswordDrafts] = useState({});
 
   const [questionForm, setQuestionForm] = useState(EMPTY_QUESTION_FORM);
+  const [examForm, setExamForm] = useState(EMPTY_EXAM_FORM);
+  const [examQuestionForm, setExamQuestionForm] = useState(EMPTY_EXAM_QUESTION_FORM);
+  const [examQuestionDrafts, setExamQuestionDrafts] = useState([]);
+  const [generalExamEdit, setGeneralExamEdit] = useState({
+    title: '',
+    durationSeconds: 1500,
+    maxAttempts: 3,
+    questionCount: 40,
+    published: true,
+    allowedClasses: [],
+  });
 
   const [loading, setLoading] = useState({
     login: false,
     overview: false,
     sessions: false,
     questions: false,
+    exams: false,
+    students: false,
+    users: false,
+    passwordHelp: false,
     addQuestion: false,
+    addExam: false,
+    updateExam: false,
     deleting: false,
   });
 
@@ -160,6 +245,18 @@ function AdminPage() {
     setSessions([]);
     setSelectedSessionIds([]);
     setQuestions([]);
+    setExams([]);
+    setStudents([]);
+    setUsers([]);
+    setPasswordHelpRequests([]);
+    setUserPasswordDrafts({});
+    setStudentTrials(null);
+    setTrialReviewOpen(false);
+    setTrialSelectedViolations({});
+    setFilters({ search: '', classRoom: '', status: '', examId: '' });
+    setStudentFilters({ search: '', classRoom: '', examId: '' });
+    setUserFilters({ search: '', classRoom: '', status: '' });
+    setHelpFilters({ search: '', status: 'open' });
   }, []);
 
   const handleUnauthorized = useCallback(
@@ -226,6 +323,87 @@ function AdminPage() {
     [handleUnauthorized, updateLoading]
   );
 
+  const loadExams = useCallback(
+    async (activeToken) => {
+      updateLoading('exams', true);
+      try {
+        const payload = await fetchAdminExams(activeToken);
+        const rows = payload.exams ?? [];
+        setExams(rows);
+
+        const generalExam = rows.find((exam) => exam.id === 'general');
+        if (generalExam) {
+          setGeneralExamEdit({
+            title: generalExam.title,
+            durationSeconds: generalExam.durationSeconds,
+            maxAttempts: generalExam.maxAttempts ?? 3,
+            questionCount: generalExam.questionCount,
+            published: generalExam.published,
+            allowedClasses: generalExam.allowedClasses ?? [],
+          });
+        }
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not load exams.');
+        }
+      } finally {
+        updateLoading('exams', false);
+      }
+    },
+    [handleUnauthorized, updateLoading]
+  );
+
+  const loadStudents = useCallback(
+    async (activeToken, activeFilters) => {
+      updateLoading('students', true);
+      try {
+        const payload = await fetchAdminStudents(activeToken, activeFilters);
+        setStudents(payload.students ?? []);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not load student trials.');
+        }
+      } finally {
+        updateLoading('students', false);
+      }
+    },
+    [handleUnauthorized, updateLoading]
+  );
+
+  const loadUsers = useCallback(
+    async (activeToken, activeFilters) => {
+      updateLoading('users', true);
+      try {
+        const payload = await fetchAdminUsers(activeToken, activeFilters);
+        setUsers(payload.users ?? []);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not load users.');
+        }
+      } finally {
+        updateLoading('users', false);
+      }
+    },
+    [handleUnauthorized, updateLoading]
+  );
+
+  const loadPasswordHelp = useCallback(
+    async (activeToken, activeFilters) => {
+      updateLoading('passwordHelp', true);
+      try {
+        const payload = await fetchAdminPasswordHelp(activeToken, activeFilters);
+        setPasswordHelpRequests(payload.requests ?? []);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not load password-help requests.');
+        }
+      } finally {
+        updateLoading('passwordHelp', false);
+      }
+    },
+    [handleUnauthorized, updateLoading]
+  );
+
   useEffect(() => {
     let active = true;
 
@@ -270,7 +448,8 @@ function AdminPage() {
 
     void loadOverview(token);
     void loadQuestions(token);
-  }, [loadOverview, loadQuestions, token]);
+    void loadExams(token);
+  }, [loadExams, loadOverview, loadQuestions, token]);
 
   useEffect(() => {
     if (!token) {
@@ -279,6 +458,30 @@ function AdminPage() {
 
     void loadSessions(token, filters);
   }, [filters, loadSessions, token]);
+
+  useEffect(() => {
+    if (!token) {
+      return;
+    }
+
+    void loadStudents(token, studentFilters);
+  }, [loadStudents, studentFilters, token]);
+
+  useEffect(() => {
+    if (!token) {
+      return;
+    }
+
+    void loadUsers(token, userFilters);
+  }, [loadUsers, token, userFilters]);
+
+  useEffect(() => {
+    if (!token) {
+      return;
+    }
+
+    void loadPasswordHelp(token, helpFilters);
+  }, [helpFilters, loadPasswordHelp, token]);
 
   useEffect(() => {
     if (!infoMessage) {
@@ -309,6 +512,24 @@ function AdminPage() {
     const validIds = new Set(sessions.map((session) => session.id));
     setSelectedSessionIds((previous) => previous.filter((id) => validIds.has(id)));
   }, [sessions]);
+
+  useEffect(() => {
+    const classOptions = meta?.classOptions ?? [];
+    if (!classOptions.length) {
+      return;
+    }
+
+    setExamForm((previous) => {
+      if (previous.allowedClasses.length > 0) {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        allowedClasses: classOptions,
+      };
+    });
+  }, [meta?.classOptions]);
 
   const handleLogin = async (event) => {
     event.preventDefault();
@@ -343,7 +564,15 @@ function AdminPage() {
     }
 
     setErrorMessage('');
-    await Promise.all([loadOverview(token), loadSessions(token, filters), loadQuestions(token)]);
+    await Promise.all([
+      loadOverview(token),
+      loadSessions(token, filters),
+      loadQuestions(token),
+      loadExams(token),
+      loadStudents(token, studentFilters),
+      loadUsers(token, userFilters),
+      loadPasswordHelp(token, helpFilters),
+    ]);
     setInfoMessage('Dashboard refreshed.');
   };
 
@@ -413,15 +642,270 @@ function AdminPage() {
     }
   };
 
+  const toggleClassInList = useCallback((value, classRoom) => {
+    const set = new Set(Array.isArray(value) ? value : []);
+    if (set.has(classRoom)) {
+      set.delete(classRoom);
+    } else {
+      set.add(classRoom);
+    }
+
+    return [...set];
+  }, []);
+
+  const mapQuestionFormToPayload = useCallback((form) => {
+    const correctOptionIds = [
+      form.correctA ? 'A' : null,
+      form.correctB ? 'B' : null,
+      form.correctC ? 'C' : null,
+      form.correctD ? 'D' : null,
+    ].filter(Boolean);
+
+    return {
+      topic: form.topic,
+      type: form.type,
+      text: form.text,
+      optionTexts: [form.optionA, form.optionB, form.optionC, form.optionD],
+      correctOptionIds,
+    };
+  }, []);
+
+  const handleAddExamQuestionDraft = (event) => {
+    event.preventDefault();
+
+    const payload = mapQuestionFormToPayload(examQuestionForm);
+    if (payload.text.trim().length < 5) {
+      setErrorMessage('Draft question text must be at least 5 characters.');
+      return;
+    }
+
+    if (payload.optionTexts.some((item) => item.trim().length === 0)) {
+      setErrorMessage('Each draft question must have 4 options.');
+      return;
+    }
+
+    if (payload.correctOptionIds.length === 0) {
+      setErrorMessage('Select at least one correct option for draft question.');
+      return;
+    }
+
+    if (payload.type === 'single' && payload.correctOptionIds.length !== 1) {
+      setErrorMessage('Single-choice draft question must have one correct option.');
+      return;
+    }
+
+    setExamQuestionDrafts((previous) => [...previous, payload]);
+    setExamQuestionForm((previous) => ({
+      ...EMPTY_EXAM_QUESTION_FORM,
+      topic: previous.topic,
+      type: previous.type,
+    }));
+    setInfoMessage('Draft question added to new exam.');
+    setErrorMessage('');
+  };
+
+  const handleRemoveExamQuestionDraft = (index) => {
+    setExamQuestionDrafts((previous) => previous.filter((_item, itemIndex) => itemIndex !== index));
+  };
+
+  const handleCreateExam = async (event) => {
+    event.preventDefault();
+    if (!token) {
+      return;
+    }
+
+    if (examQuestionDrafts.length === 0) {
+      setErrorMessage('Add at least one draft question before creating an exam.');
+      return;
+    }
+
+    if (examForm.allowedClasses.length === 0) {
+      setErrorMessage('Select at least one class for the exam.');
+      return;
+    }
+
+    updateLoading('addExam', true);
+    setErrorMessage('');
+
+    try {
+      const payload = await createAdminExam(token, {
+        id: examForm.id || undefined,
+        title: examForm.title,
+        description: examForm.description,
+        durationSeconds: Number(examForm.durationSeconds),
+        maxAttempts: Number(examForm.maxAttempts) || 3,
+        questionCount: Number(examForm.questionCount) || examQuestionDrafts.length,
+        published: Boolean(examForm.published),
+        allowedClasses: examForm.allowedClasses,
+        questions: examQuestionDrafts,
+      });
+
+      setExamForm((previous) => ({
+        ...EMPTY_EXAM_FORM,
+        durationSeconds: previous.durationSeconds,
+        maxAttempts: previous.maxAttempts,
+        questionCount: previous.questionCount,
+      }));
+      setExamQuestionForm(EMPTY_EXAM_QUESTION_FORM);
+      setExamQuestionDrafts([]);
+
+      await Promise.all([
+        loadExams(token),
+        loadOverview(token),
+        loadQuestions(token),
+      ]);
+      setInfoMessage(`Exam created: ${payload.exam?.title ?? 'New exam'}.`);
+    } catch (error) {
+      if (!handleUnauthorized(error)) {
+        setErrorMessage(error.message || 'Could not create exam.');
+      }
+    } finally {
+      updateLoading('addExam', false);
+    }
+  };
+
+  const handleSaveGeneralExam = async (event) => {
+    event.preventDefault();
+    if (!token) {
+      return;
+    }
+
+    if (generalExamEdit.allowedClasses.length === 0) {
+      setErrorMessage('General exam must allow at least one class.');
+      return;
+    }
+
+    updateLoading('updateExam', true);
+    setErrorMessage('');
+
+    try {
+      const payload = await updateAdminExam(token, 'general', {
+        title: generalExamEdit.title,
+        durationSeconds: Number(generalExamEdit.durationSeconds),
+        maxAttempts: Number(generalExamEdit.maxAttempts) || 3,
+        questionCount: Number(generalExamEdit.questionCount),
+        published: Boolean(generalExamEdit.published),
+        allowedClasses: generalExamEdit.allowedClasses,
+      });
+      await Promise.all([loadExams(token), loadOverview(token)]);
+      setInfoMessage(`Saved: ${payload.exam?.title ?? 'General exam'}.`);
+    } catch (error) {
+      if (!handleUnauthorized(error)) {
+        setErrorMessage(error.message || 'Could not update general exam.');
+      }
+    } finally {
+      updateLoading('updateExam', false);
+    }
+  };
+
+  const handleOpenStudentTrials = useCallback(
+    async (student) => {
+      if (!token || !student?.studentKey) {
+        return;
+      }
+
+      setStudentTrialLoading(true);
+      setErrorMessage('');
+
+      try {
+        const payload = await fetchAdminStudentTrials(token, student.studentKey);
+        setStudentTrials(payload);
+        setTrialReviewOpen(true);
+        setTrialSelectedViolations({});
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not load student trials.');
+        }
+      } finally {
+        setStudentTrialLoading(false);
+      }
+    },
+    [handleUnauthorized, token]
+  );
+
+  const handleCloseStudentTrials = () => {
+    setTrialReviewOpen(false);
+    setStudentTrials(null);
+    setTrialSelectedViolations({});
+  };
+
+  const handleToggleTrialViolation = (sessionId, violationId, checked) => {
+    setTrialSelectedViolations((previous) => {
+      const current = new Set(previous[sessionId] ?? []);
+      if (checked) {
+        current.add(violationId);
+      } else {
+        current.delete(violationId);
+      }
+
+      return {
+        ...previous,
+        [sessionId]: [...current],
+      };
+    });
+  };
+
+  const handleWaiveTrialViolations = async (sessionId, mode, waived) => {
+    if (!token || !sessionId) {
+      return;
+    }
+
+    const selectedIds = trialSelectedViolations[sessionId] ?? [];
+    if (mode === 'selected' && selectedIds.length === 0) {
+      setErrorMessage('Select at least one violation to update.');
+      return;
+    }
+
+    updateLoading('deleting', true);
+    setErrorMessage('');
+
+    try {
+      await waiveAdminSessionViolations(token, sessionId, {
+        waiveAll: mode === 'all',
+        violationIds: mode === 'selected' ? selectedIds : [],
+        waived,
+      });
+
+      if (!studentTrials?.student?.studentKey) {
+        return;
+      }
+
+      const refreshed = await fetchAdminStudentTrials(token, studentTrials.student.studentKey);
+      setStudentTrials(refreshed);
+      setTrialSelectedViolations((previous) => ({
+        ...previous,
+        [sessionId]: [],
+      }));
+
+      await Promise.all([
+        refreshOverviewAndSessions(token),
+        loadStudents(token, studentFilters),
+      ]);
+      setInfoMessage(`Violations updated for trial ${sessionId.slice(0, 8)}.`);
+    } catch (error) {
+      if (!handleUnauthorized(error)) {
+        setErrorMessage(error.message || 'Could not update violations.');
+      }
+    } finally {
+      updateLoading('deleting', false);
+    }
+  };
+
   const refreshOverviewAndSessions = useCallback(
     async (activeToken) => {
       if (!activeToken) {
         return;
       }
 
-      await Promise.all([loadOverview(activeToken), loadSessions(activeToken, filters)]);
+      await Promise.all([
+        loadOverview(activeToken),
+        loadSessions(activeToken, filters),
+        loadStudents(activeToken, studentFilters),
+        loadUsers(activeToken, userFilters),
+        loadPasswordHelp(activeToken, helpFilters),
+      ]);
     },
-    [filters, loadOverview, loadSessions]
+    [filters, helpFilters, loadOverview, loadPasswordHelp, loadSessions, loadStudents, loadUsers, studentFilters, userFilters]
   );
 
   const handleToggleWidget = useCallback((widgetKey) => {
@@ -607,6 +1091,173 @@ function AdminPage() {
     [handleUnauthorized, refreshOverviewAndSessions, token, updateLoading]
   );
 
+  const handleToggleUserDisabled = useCallback(
+    async (user) => {
+      if (!token || !user?.id) {
+        return;
+      }
+
+      setErrorMessage('');
+      updateLoading('users', true);
+      try {
+        const payload = await updateAdminUser(token, user.id, {
+          disabled: !user.disabled,
+        });
+        await Promise.all([
+          loadUsers(token, userFilters),
+          loadPasswordHelp(token, helpFilters),
+        ]);
+        setInfoMessage(
+          `${payload.user?.fullName ?? 'User'} ${payload.user?.disabled ? 'disabled' : 'enabled'}.`
+        );
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not update user status.');
+        }
+      } finally {
+        updateLoading('users', false);
+      }
+    },
+    [
+      handleUnauthorized,
+      helpFilters,
+      loadPasswordHelp,
+      loadUsers,
+      token,
+      updateLoading,
+      userFilters,
+    ]
+  );
+
+  const handleForcePasswordChange = useCallback(
+    async (user) => {
+      if (!token || !user?.id) {
+        return;
+      }
+
+      setErrorMessage('');
+      updateLoading('users', true);
+      try {
+        await updateAdminUser(token, user.id, {
+          mustChangePassword: !user.mustChangePassword,
+        });
+        await loadUsers(token, userFilters);
+        setInfoMessage('Password-change flag updated.');
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not update password-change flag.');
+        }
+      } finally {
+        updateLoading('users', false);
+      }
+    },
+    [handleUnauthorized, loadUsers, token, updateLoading, userFilters]
+  );
+
+  const handleEditUser = useCallback(
+    async (user) => {
+      if (!token || !user?.id) {
+        return;
+      }
+
+      const fullName = window.prompt('Full name', user.fullName ?? '');
+      if (fullName === null) {
+        return;
+      }
+      const classRoom = window.prompt('Class', user.classRoom ?? '');
+      if (classRoom === null) {
+        return;
+      }
+      const email = window.prompt('Email', user.email ?? '');
+      if (email === null) {
+        return;
+      }
+
+      setErrorMessage('');
+      updateLoading('users', true);
+      try {
+        await updateAdminUser(token, user.id, { fullName, classRoom, email });
+        await loadUsers(token, userFilters);
+        setInfoMessage('User details updated.');
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not update user details.');
+        }
+      } finally {
+        updateLoading('users', false);
+      }
+    },
+    [handleUnauthorized, loadUsers, token, updateLoading, userFilters]
+  );
+
+  const handleResetUserPassword = useCallback(
+    async (user) => {
+      if (!token || !user?.id) {
+        return;
+      }
+
+      const draftPassword = userPasswordDrafts[user.id] ?? '';
+      if (!draftPassword || draftPassword.length < 4) {
+        setErrorMessage('Enter a new password (at least 4 characters) for this user.');
+        return;
+      }
+
+      setErrorMessage('');
+      updateLoading('users', true);
+      try {
+        await resetAdminUserPassword(token, user.id, {
+          newPassword: draftPassword,
+          mustChangePassword: true,
+        });
+        setUserPasswordDrafts((previous) => ({ ...previous, [user.id]: '' }));
+        await Promise.all([
+          loadUsers(token, userFilters),
+          loadPasswordHelp(token, helpFilters),
+        ]);
+        setInfoMessage(`Password reset for ${user.fullName}.`);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not reset user password.');
+        }
+      } finally {
+        updateLoading('users', false);
+      }
+    },
+    [
+      handleUnauthorized,
+      helpFilters,
+      loadPasswordHelp,
+      loadUsers,
+      token,
+      updateLoading,
+      userFilters,
+      userPasswordDrafts,
+    ]
+  );
+
+  const handleResolveHelpRequest = useCallback(
+    async (request) => {
+      if (!token || !request?.id) {
+        return;
+      }
+
+      setErrorMessage('');
+      updateLoading('passwordHelp', true);
+      try {
+        await resolveAdminPasswordHelp(token, request.id);
+        await loadPasswordHelp(token, helpFilters);
+        setInfoMessage('Password-help request marked as resolved.');
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not resolve password-help request.');
+        }
+      } finally {
+        updateLoading('passwordHelp', false);
+      }
+    },
+    [handleUnauthorized, helpFilters, loadPasswordHelp, token, updateLoading]
+  );
+
   const scoreDistribution = useMemo(
     () => overview?.scoreDistribution ?? [],
     [overview?.scoreDistribution]
@@ -770,6 +1421,14 @@ function AdminPage() {
           <span>Average Rating</span>
           <strong>{overview?.totals?.averageRating ?? 0}/5</strong>
         </article>
+        <article className="result-box">
+          <span>Unique Students</span>
+          <strong>{overview?.totals?.uniqueStudents ?? 0}</strong>
+        </article>
+        <article className="result-box">
+          <span>Repeat Candidates</span>
+          <strong>{overview?.totals?.repeatCandidates ?? 0}</strong>
+        </article>
       </section>
       )}
 
@@ -904,6 +1563,79 @@ function AdminPage() {
                 )}
               </tbody>
             </table>
+          </div>
+        </article>
+        )}
+      </section>
+      )}
+
+      {(widgets.outstandingStudents || widgets.classLeaderboards) && (
+      <section className={`admin-grid-2 ${!widgets.outstandingStudents || !widgets.classLeaderboards ? 'single-column' : ''}`}>
+        {widgets.outstandingStudents && (
+        <article className="card-panel wide admin-card">
+          <div className="panel-title-row">
+            <h2>Outstanding Students Overall</h2>
+          </div>
+
+          <div className="table-wrap medium">
+            <table>
+              <thead>
+                <tr>
+                  <th>Student</th>
+                  <th>Class</th>
+                  <th>Exam</th>
+                  <th>Best %</th>
+                  <th>Avg %</th>
+                  <th>Trials</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(overview?.outstandingStudents ?? []).map((student) => (
+                  <tr key={student.studentKey}>
+                    <td title={student.studentName}>
+                      <span className="truncate-line">{student.studentName}</span>
+                    </td>
+                    <td>{student.classRoom}</td>
+                    <td title={student.bestExamTitle}>
+                      <span className="truncate-line">{student.bestExamTitle ?? '-'}</span>
+                    </td>
+                    <td>{student.bestFinalPercent}%</td>
+                    <td>{student.averageFinalPercent}%</td>
+                    <td>{student.totalTrials}</td>
+                  </tr>
+                ))}
+                {!overview?.outstandingStudents?.length && (
+                  <tr>
+                    <td colSpan={6}>No submitted trials yet.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </article>
+        )}
+
+        {widgets.classLeaderboards && (
+        <article className="card-panel wide admin-card">
+          <div className="panel-title-row">
+            <h2>Leaderboards Per Class</h2>
+          </div>
+
+          <div className="leaderboard-grid">
+            {(overview?.classLeaderboards ?? []).map((item) => (
+              <article key={item.classRoom} className="leaderboard-card">
+                <h3>{item.classRoom}</h3>
+                <ol>
+                  {item.leaders.map((leader) => (
+                    <li key={leader.studentKey}>
+                      <span className="truncate-line">{leader.studentName}</span>
+                      <strong>{leader.bestFinalPercent}%</strong>
+                    </li>
+                  ))}
+                </ol>
+              </article>
+            ))}
+            {!overview?.classLeaderboards?.length && <p className="muted">No leaderboard data yet.</p>}
           </div>
         </article>
         )}
@@ -1050,6 +1782,18 @@ function AdminPage() {
             <option value="active">Active</option>
             <option value="time_up">Time Up</option>
           </select>
+
+          <select
+            value={filters.examId}
+            onChange={(event) => setFilters((previous) => ({ ...previous, examId: event.target.value }))}
+          >
+            <option value="">All exams</option>
+            {exams.map((exam) => (
+              <option key={exam.id} value={exam.id}>
+                {exam.title}
+              </option>
+            ))}
+          </select>
         </div>
 
         <div className="table-wrap large">
@@ -1065,6 +1809,8 @@ function AdminPage() {
                   />
                 </th>
                 <th>Session ID</th>
+                <th>Exam</th>
+                <th>Trial</th>
                 <th>Name</th>
                 <th>Class</th>
                 <th>Email</th>
@@ -1094,6 +1840,10 @@ function AdminPage() {
                   <td className="mono" title={session.id}>
                     <span className="truncate-line">{session.id}</span>
                   </td>
+                  <td title={session.examTitle}>
+                    <span className="truncate-line">{session.examTitle}</span>
+                  </td>
+                  <td>#{session.trialNumber ?? 1}</td>
                   <td title={session.studentName}>
                     <span className="truncate-line">{session.studentName}</span>
                   </td>
@@ -1128,7 +1878,7 @@ function AdminPage() {
               ))}
               {!sessions.length && (
                 <tr>
-                  <td colSpan={13}>
+                  <td colSpan={15}>
                     {loading.sessions ? 'Loading sessions...' : 'No sessions found for this filter.'}
                   </td>
                 </tr>
@@ -1138,6 +1888,908 @@ function AdminPage() {
         </div>
 
         <p className="muted">Selected on screen: {selectedVisibleCount}</p>
+      </section>
+      )}
+
+      {widgets.studentTrials && (
+      <section className="card-panel wide admin-card">
+        <div className="panel-title-row">
+          <h2>Student Trial Groups</h2>
+          <span className="muted">{students.length} student(s)</span>
+        </div>
+
+        <div className="admin-filters">
+          <input
+            type="search"
+            placeholder="Search by name, email or exam"
+            value={studentFilters.search}
+            onChange={(event) =>
+              setStudentFilters((previous) => ({ ...previous, search: event.target.value }))
+            }
+          />
+
+          <select
+            value={studentFilters.classRoom}
+            onChange={(event) =>
+              setStudentFilters((previous) => ({ ...previous, classRoom: event.target.value }))
+            }
+          >
+            <option value="">All classes</option>
+            {(meta?.classOptions ?? []).map((classOption) => (
+              <option key={classOption} value={classOption}>
+                {classOption}
+              </option>
+            ))}
+          </select>
+
+          <select
+            value={studentFilters.examId}
+            onChange={(event) =>
+              setStudentFilters((previous) => ({ ...previous, examId: event.target.value }))
+            }
+          >
+            <option value="">All exams</option>
+            {exams.map((exam) => (
+              <option key={exam.id} value={exam.id}>
+                {exam.title}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="table-wrap large">
+          <table>
+            <thead>
+              <tr>
+                <th>Student</th>
+                <th>Class</th>
+                <th>Exam</th>
+                <th>Total Trials</th>
+                <th>Submitted</th>
+                <th>Best %</th>
+                <th>Avg %</th>
+                <th>Latest</th>
+                <th className="cell-tight">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {students.map((student) => (
+                <tr key={student.studentKey}>
+                  <td title={student.studentName}>
+                    <span className="truncate-line">{student.studentName}</span>
+                  </td>
+                  <td>{student.classRoom}</td>
+                  <td title={student.examTitle}>
+                    <span className="truncate-line">{student.examTitle}</span>
+                  </td>
+                  <td>{student.totalTrials}</td>
+                  <td>{student.submittedTrials}</td>
+                  <td>{student.bestFinalPercent}%</td>
+                  <td>{student.averageFinalPercent}%</td>
+                  <td>{formatDate(student.latestStartedAt)}</td>
+                  <td className="cell-tight">
+                    <button
+                      type="button"
+                      className="btn btn-outline btn-xs"
+                      onClick={() => handleOpenStudentTrials(student)}
+                      disabled={studentTrialLoading}
+                    >
+                      {studentTrialLoading ? 'Loading...' : 'View Trials'}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {!students.length && (
+                <tr>
+                  <td colSpan={9}>{loading.students ? 'Loading students...' : 'No student trial groups found.'}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      )}
+
+      {widgets.userManager && (
+      <section className="card-panel wide admin-card">
+        <div className="panel-title-row">
+          <h2>User Management</h2>
+          <span className="muted">{users.length} user(s)</span>
+        </div>
+
+        <div className="admin-filters">
+          <input
+            type="search"
+            placeholder="Search by name or email"
+            value={userFilters.search}
+            onChange={(event) =>
+              setUserFilters((previous) => ({ ...previous, search: event.target.value }))
+            }
+          />
+
+          <select
+            value={userFilters.classRoom}
+            onChange={(event) =>
+              setUserFilters((previous) => ({ ...previous, classRoom: event.target.value }))
+            }
+          >
+            <option value="">All classes</option>
+            {(meta?.classOptions ?? []).map((classOption) => (
+              <option key={classOption} value={classOption}>
+                {classOption}
+              </option>
+            ))}
+          </select>
+
+          <select
+            value={userFilters.status}
+            onChange={(event) =>
+              setUserFilters((previous) => ({ ...previous, status: event.target.value }))
+            }
+          >
+            <option value="">All status</option>
+            <option value="active">Active</option>
+            <option value="disabled">Disabled</option>
+            <option value="must_change">Must Change Password</option>
+          </select>
+        </div>
+
+        <div className="table-wrap large">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Class</th>
+                <th>Email</th>
+                <th>Trials</th>
+                <th>Best %</th>
+                <th>Last Login</th>
+                <th>Flags</th>
+                <th>Help</th>
+                <th>Reset Password</th>
+                <th className="cell-tight">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((user) => (
+                <tr key={user.id}>
+                  <td title={user.fullName}>
+                    <span className="truncate-line">{user.fullName}</span>
+                  </td>
+                  <td>{user.classRoom}</td>
+                  <td title={user.email}>
+                    <span className="truncate-line">{user.email}</span>
+                  </td>
+                  <td>{user.totalTrials ?? 0}</td>
+                  <td>{user.bestFinalPercent ?? 0}%</td>
+                  <td>{formatDate(user.lastLoginAt)}</td>
+                  <td>
+                    {user.disabled ? 'Disabled' : 'Active'}
+                    <br />
+                    {user.mustChangePassword ? 'Must change password' : 'Password OK'}
+                  </td>
+                  <td>{user.openHelpRequests ?? 0}</td>
+                  <td>
+                    <input
+                      type="password"
+                      value={userPasswordDrafts[user.id] ?? ''}
+                      placeholder="new password"
+                      onChange={(event) =>
+                        setUserPasswordDrafts((previous) => ({
+                          ...previous,
+                          [user.id]: event.target.value,
+                        }))
+                      }
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-outline btn-xs"
+                      disabled={loading.users}
+                      onClick={() => handleResetUserPassword(user)}
+                    >
+                      Reset
+                    </button>
+                  </td>
+                  <td className="cell-tight">
+                    <div className="inline-actions compact">
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-xs"
+                        disabled={loading.users}
+                        onClick={() => handleEditUser(user)}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-xs"
+                        disabled={loading.users}
+                        onClick={() => handleForcePasswordChange(user)}
+                      >
+                        {user.mustChangePassword ? 'Clear Force' : 'Force Change'}
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn btn-xs ${user.disabled ? 'btn-secondary' : 'btn-warning'}`}
+                        disabled={loading.users}
+                        onClick={() => handleToggleUserDisabled(user)}
+                      >
+                        {user.disabled ? 'Enable' : 'Disable'}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {!users.length && (
+                <tr>
+                  <td colSpan={10}>{loading.users ? 'Loading users...' : 'No users found.'}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      )}
+
+      {widgets.passwordHelp && (
+      <section className="card-panel wide admin-card">
+        <div className="panel-title-row">
+          <h2>Password Help Requests</h2>
+          <span className="muted">{passwordHelpRequests.length} request(s)</span>
+        </div>
+
+        <div className="admin-filters">
+          <input
+            type="search"
+            placeholder="Search by name, class, email or message"
+            value={helpFilters.search}
+            onChange={(event) =>
+              setHelpFilters((previous) => ({ ...previous, search: event.target.value }))
+            }
+          />
+          <select
+            value={helpFilters.status}
+            onChange={(event) =>
+              setHelpFilters((previous) => ({ ...previous, status: event.target.value }))
+            }
+          >
+            <option value="open">Open</option>
+            <option value="resolved">Resolved</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+
+        <div className="table-wrap medium">
+          <table>
+            <thead>
+              <tr>
+                <th>Student</th>
+                <th>Class</th>
+                <th>Email</th>
+                <th>Message</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Resolved</th>
+                <th className="cell-tight">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {passwordHelpRequests.map((request) => (
+                <tr key={request.id}>
+                  <td title={request.fullName}>
+                    <span className="truncate-line">{request.fullName}</span>
+                  </td>
+                  <td>{request.classRoom}</td>
+                  <td title={request.email}>
+                    <span className="truncate-line">{request.email}</span>
+                  </td>
+                  <td title={request.message}>
+                    <span className="truncate-2">{request.message || '-'}</span>
+                  </td>
+                  <td>{request.status}</td>
+                  <td>{formatDate(request.createdAt)}</td>
+                  <td>{formatDate(request.resolvedAt)}</td>
+                  <td className="cell-tight">
+                    <button
+                      type="button"
+                      className="btn btn-outline btn-xs"
+                      disabled={loading.passwordHelp || request.status === 'resolved'}
+                      onClick={() => handleResolveHelpRequest(request)}
+                    >
+                      Resolve
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {!passwordHelpRequests.length && (
+                <tr>
+                  <td colSpan={8}>
+                    {loading.passwordHelp ? 'Loading password-help requests...' : 'No requests found.'}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      )}
+
+      {trialReviewOpen && studentTrials && (
+        <div className="modal-backdrop" onClick={handleCloseStudentTrials}>
+          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+            <div className="panel-title-row">
+              <h2>Trial Review: {studentTrials.student?.studentName}</h2>
+              <button type="button" className="btn btn-outline btn-xs" onClick={handleCloseStudentTrials}>
+                Close
+              </button>
+            </div>
+            <p className="muted">
+              {studentTrials.student?.classRoom} | {studentTrials.student?.examTitle} |{' '}
+              {studentTrials.student?.email}
+            </p>
+
+            <div className="trial-list">
+              {(studentTrials.trials ?? []).map((trial) => (
+                <article key={trial.id} className="trial-card">
+                  <div className="panel-title-row">
+                    <h3>
+                      Trial #{trial.trialNumber} - {trial.status}
+                    </h3>
+                    <span className="muted">{trial.id.slice(0, 8)}</span>
+                  </div>
+
+                  <div className="result-grid">
+                    <div className="result-box">
+                      <span>Final</span>
+                      <strong>{trial.summary?.finalPercent ?? 0}%</strong>
+                    </div>
+                    <div className="result-box">
+                      <span>Raw</span>
+                      <strong>{trial.summary?.rawPercent ?? 0}%</strong>
+                    </div>
+                    <div className="result-box">
+                      <span>Active Violations</span>
+                      <strong>{trial.summary?.violationsCount ?? 0}</strong>
+                    </div>
+                    <div className="result-box">
+                      <span>Waived Violations</span>
+                      <strong>{trial.summary?.waivedViolationsCount ?? 0}</strong>
+                    </div>
+                  </div>
+
+                  <div className="inline-actions compact">
+                    <button
+                      type="button"
+                      className="btn btn-outline btn-xs"
+                      onClick={() => handleWaiveTrialViolations(trial.id, 'selected', true)}
+                      disabled={loading.deleting}
+                    >
+                      Waive Selected
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-outline btn-xs"
+                      onClick={() => handleWaiveTrialViolations(trial.id, 'selected', false)}
+                      disabled={loading.deleting}
+                    >
+                      Unwaive Selected
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-outline btn-xs"
+                      onClick={() => handleWaiveTrialViolations(trial.id, 'all', true)}
+                      disabled={loading.deleting}
+                    >
+                      Waive All
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-outline btn-xs"
+                      onClick={() => handleWaiveTrialViolations(trial.id, 'all', false)}
+                      disabled={loading.deleting}
+                    >
+                      Unwaive All
+                    </button>
+                  </div>
+
+                  <div className="table-wrap medium">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th className="cell-tight">Pick</th>
+                          <th>Violation Type</th>
+                          <th>Detail</th>
+                          <th>Status</th>
+                          <th>Time</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(trial.violations ?? []).map((violation) => (
+                          <tr key={violation.id}>
+                            <td className="cell-tight">
+                              <input
+                                type="checkbox"
+                                checked={(trialSelectedViolations[trial.id] ?? []).includes(violation.id)}
+                                onChange={(event) =>
+                                  handleToggleTrialViolation(trial.id, violation.id, event.target.checked)
+                                }
+                              />
+                            </td>
+                            <td>{violation.type}</td>
+                            <td title={violation.detail}>
+                              <span className="truncate-line">{violation.detail || '-'}</span>
+                            </td>
+                            <td>{violation.waived ? 'Waived' : 'Active'}</td>
+                            <td>{formatDate(violation.occurredAt)}</td>
+                          </tr>
+                        ))}
+                        {!trial.violations?.length && (
+                          <tr>
+                            <td colSpan={5}>No violations logged for this trial.</td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <details className="trial-review-details">
+                    <summary>Review Answers ({trial.questionReview?.length ?? 0})</summary>
+                    <div className="table-wrap large">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>#</th>
+                            <th>Question</th>
+                            <th>Selected</th>
+                            <th>Correct</th>
+                            <th>Result</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(trial.questionReview ?? []).map((item) => (
+                            <tr key={`${trial.id}-${item.questionId}`}>
+                              <td>{item.index}</td>
+                              <td title={item.text}>
+                                <span className="truncate-2">{item.text}</span>
+                              </td>
+                              <td>{(item.selectedOptionIds ?? []).join(', ') || '-'}</td>
+                              <td>{(item.correctOptionIds ?? []).join(', ') || '-'}</td>
+                              <td>{item.isCorrect ? 'Correct' : 'Wrong'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+                </article>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {widgets.examManager && (
+      <section className="admin-grid-2">
+        <article className="card-panel wide admin-card">
+          <div className="panel-title-row">
+            <h2>General Exam Settings</h2>
+            {loading.updateExam && <span className="muted">Saving...</span>}
+          </div>
+
+          <form className="form-stack" onSubmit={handleSaveGeneralExam}>
+            <label htmlFor="generalTitle">General Exam Name</label>
+            <input
+              id="generalTitle"
+              value={generalExamEdit.title}
+              onChange={(event) =>
+                setGeneralExamEdit((previous) => ({ ...previous, title: event.target.value }))
+              }
+              required
+            />
+
+            <label htmlFor="generalDuration">Duration (seconds)</label>
+            <input
+              id="generalDuration"
+              type="number"
+              min={60}
+              max={10800}
+              value={generalExamEdit.durationSeconds}
+              onChange={(event) =>
+                setGeneralExamEdit((previous) => ({
+                  ...previous,
+                  durationSeconds: Number(event.target.value),
+                }))
+              }
+            />
+
+            <label htmlFor="generalMaxAttempts">Max Attempts</label>
+            <input
+              id="generalMaxAttempts"
+              type="number"
+              min={1}
+              max={50}
+              value={generalExamEdit.maxAttempts}
+              onChange={(event) =>
+                setGeneralExamEdit((previous) => ({
+                  ...previous,
+                  maxAttempts: Number(event.target.value),
+                }))
+              }
+            />
+
+            <label htmlFor="generalQuestionCount">Question Count</label>
+            <input
+              id="generalQuestionCount"
+              type="number"
+              min={1}
+              max={500}
+              value={generalExamEdit.questionCount}
+              onChange={(event) =>
+                setGeneralExamEdit((previous) => ({
+                  ...previous,
+                  questionCount: Number(event.target.value),
+                }))
+              }
+            />
+
+            <label>Allowed Classes</label>
+            <div className="class-chip-grid">
+              {(meta?.classOptions ?? []).map((classOption) => (
+                <label key={classOption} className="widget-toggle">
+                  <input
+                    type="checkbox"
+                    checked={generalExamEdit.allowedClasses.includes(classOption)}
+                    onChange={() =>
+                      setGeneralExamEdit((previous) => ({
+                        ...previous,
+                        allowedClasses: toggleClassInList(previous.allowedClasses, classOption),
+                      }))
+                    }
+                  />
+                  <span>{classOption}</span>
+                </label>
+              ))}
+            </div>
+
+            <label className="widget-toggle on">
+              <input
+                type="checkbox"
+                checked={generalExamEdit.published}
+                onChange={(event) =>
+                  setGeneralExamEdit((previous) => ({ ...previous, published: event.target.checked }))
+                }
+              />
+              <span>Published</span>
+            </label>
+
+            <button type="submit" className="btn btn-primary" disabled={loading.updateExam}>
+              {loading.updateExam ? 'Saving...' : 'Save General Exam'}
+            </button>
+          </form>
+        </article>
+
+        <article className="card-panel wide admin-card">
+          <div className="panel-title-row">
+            <h2>Create New Exam With Questions</h2>
+            <span className="muted">Draft questions: {examQuestionDrafts.length}</span>
+          </div>
+
+          <form className="form-stack" onSubmit={handleCreateExam}>
+            <label htmlFor="newExamId">Exam ID (optional)</label>
+            <input
+              id="newExamId"
+              value={examForm.id}
+              onChange={(event) => setExamForm((previous) => ({ ...previous, id: event.target.value }))}
+              placeholder="example: first-term-jss1"
+            />
+
+            <label htmlFor="newExamTitle">Exam Title</label>
+            <input
+              id="newExamTitle"
+              value={examForm.title}
+              onChange={(event) =>
+                setExamForm((previous) => ({ ...previous, title: event.target.value }))
+              }
+              required
+            />
+
+            <label htmlFor="newExamDescription">Description</label>
+            <input
+              id="newExamDescription"
+              value={examForm.description}
+              onChange={(event) =>
+                setExamForm((previous) => ({ ...previous, description: event.target.value }))
+              }
+              placeholder="Optional short note"
+            />
+
+            <label htmlFor="newExamDuration">Duration (seconds)</label>
+            <input
+              id="newExamDuration"
+              type="number"
+              min={60}
+              max={10800}
+              value={examForm.durationSeconds}
+              onChange={(event) =>
+                setExamForm((previous) => ({
+                  ...previous,
+                  durationSeconds: Number(event.target.value),
+                }))
+              }
+            />
+
+            <label htmlFor="newExamMaxAttempts">Max Attempts</label>
+            <input
+              id="newExamMaxAttempts"
+              type="number"
+              min={1}
+              max={50}
+              value={examForm.maxAttempts}
+              onChange={(event) =>
+                setExamForm((previous) => ({
+                  ...previous,
+                  maxAttempts: Number(event.target.value),
+                }))
+              }
+            />
+
+            <label htmlFor="newExamQuestionCount">Question Count</label>
+            <input
+              id="newExamQuestionCount"
+              type="number"
+              min={1}
+              max={500}
+              value={examForm.questionCount}
+              onChange={(event) =>
+                setExamForm((previous) => ({
+                  ...previous,
+                  questionCount: Number(event.target.value),
+                }))
+              }
+            />
+
+            <label>Allowed Classes</label>
+            <div className="class-chip-grid">
+              {(meta?.classOptions ?? []).map((classOption) => (
+                <label key={classOption} className="widget-toggle">
+                  <input
+                    type="checkbox"
+                    checked={examForm.allowedClasses.includes(classOption)}
+                    onChange={() =>
+                      setExamForm((previous) => ({
+                        ...previous,
+                        allowedClasses: toggleClassInList(previous.allowedClasses, classOption),
+                      }))
+                    }
+                  />
+                  <span>{classOption}</span>
+                </label>
+              ))}
+            </div>
+
+            <label className="widget-toggle on">
+              <input
+                type="checkbox"
+                checked={examForm.published}
+                onChange={(event) =>
+                  setExamForm((previous) => ({ ...previous, published: event.target.checked }))
+                }
+              />
+              <span>Publish Immediately</span>
+            </label>
+
+            <fieldset className="exam-draft-box">
+              <legend>Add Draft Question</legend>
+              <div className="form-stack">
+                <label htmlFor="draftTopic">Topic</label>
+                <select
+                  id="draftTopic"
+                  value={examQuestionForm.topic}
+                  onChange={(event) =>
+                    setExamQuestionForm((previous) => ({ ...previous, topic: event.target.value }))
+                  }
+                >
+                  {TOPIC_OPTIONS.map((topic) => (
+                    <option key={topic} value={topic}>
+                      {topic}
+                    </option>
+                  ))}
+                </select>
+
+                <label htmlFor="draftType">Type</label>
+                <select
+                  id="draftType"
+                  value={examQuestionForm.type}
+                  onChange={(event) =>
+                    setExamQuestionForm((previous) => ({ ...previous, type: event.target.value }))
+                  }
+                >
+                  <option value="single">Single Choice</option>
+                  <option value="multi">Multi Choice</option>
+                </select>
+
+                <label htmlFor="draftText">Question Text</label>
+                <input
+                  id="draftText"
+                  value={examQuestionForm.text}
+                  onChange={(event) =>
+                    setExamQuestionForm((previous) => ({ ...previous, text: event.target.value }))
+                  }
+                />
+
+                <label htmlFor="draftA">Option A</label>
+                <input
+                  id="draftA"
+                  value={examQuestionForm.optionA}
+                  onChange={(event) =>
+                    setExamQuestionForm((previous) => ({ ...previous, optionA: event.target.value }))
+                  }
+                />
+                <label htmlFor="draftB">Option B</label>
+                <input
+                  id="draftB"
+                  value={examQuestionForm.optionB}
+                  onChange={(event) =>
+                    setExamQuestionForm((previous) => ({ ...previous, optionB: event.target.value }))
+                  }
+                />
+                <label htmlFor="draftC">Option C</label>
+                <input
+                  id="draftC"
+                  value={examQuestionForm.optionC}
+                  onChange={(event) =>
+                    setExamQuestionForm((previous) => ({ ...previous, optionC: event.target.value }))
+                  }
+                />
+                <label htmlFor="draftD">Option D</label>
+                <input
+                  id="draftD"
+                  value={examQuestionForm.optionD}
+                  onChange={(event) =>
+                    setExamQuestionForm((previous) => ({ ...previous, optionD: event.target.value }))
+                  }
+                />
+              </div>
+
+              <label>Correct Answers</label>
+              <div className="checkbox-row">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={examQuestionForm.correctA}
+                    onChange={(event) =>
+                      setExamQuestionForm((previous) => ({ ...previous, correctA: event.target.checked }))
+                    }
+                  />
+                  A
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={examQuestionForm.correctB}
+                    onChange={(event) =>
+                      setExamQuestionForm((previous) => ({ ...previous, correctB: event.target.checked }))
+                    }
+                  />
+                  B
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={examQuestionForm.correctC}
+                    onChange={(event) =>
+                      setExamQuestionForm((previous) => ({ ...previous, correctC: event.target.checked }))
+                    }
+                  />
+                  C
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={examQuestionForm.correctD}
+                    onChange={(event) =>
+                      setExamQuestionForm((previous) => ({ ...previous, correctD: event.target.checked }))
+                    }
+                  />
+                  D
+                </label>
+              </div>
+
+              <div className="inline-actions">
+                <button type="button" className="btn btn-outline" onClick={handleAddExamQuestionDraft}>
+                  Add Draft Question
+                </button>
+              </div>
+            </fieldset>
+
+            <div className="table-wrap medium">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Question</th>
+                    <th>Type</th>
+                    <th>Answer Key</th>
+                    <th className="cell-tight">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {examQuestionDrafts.map((draft, index) => (
+                    <tr key={`draft-${index + 1}`}>
+                      <td>{index + 1}</td>
+                      <td title={draft.text}>
+                        <span className="truncate-2">{draft.text}</span>
+                      </td>
+                      <td>{draft.type}</td>
+                      <td>{draft.correctOptionIds.join(', ')}</td>
+                      <td className="cell-tight">
+                        <button
+                          type="button"
+                          className="btn btn-outline btn-xs"
+                          onClick={() => handleRemoveExamQuestionDraft(index)}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {!examQuestionDrafts.length && (
+                    <tr>
+                      <td colSpan={5}>No draft questions yet.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <button type="submit" className="btn btn-primary" disabled={loading.addExam}>
+              {loading.addExam ? 'Creating Exam...' : 'Create Exam'}
+            </button>
+          </form>
+
+          <div className="panel-title-row">
+            <h2>Published / Draft Exams</h2>
+            {loading.exams && <span className="muted">Loading...</span>}
+          </div>
+
+          <div className="table-wrap medium">
+            <table>
+              <thead>
+                <tr>
+                  <th>Exam</th>
+                  <th>ID</th>
+                  <th>Status</th>
+                  <th>Attempts</th>
+                  <th>Q Needed</th>
+                  <th>Q Available</th>
+                  <th>Classes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {exams.map((exam) => (
+                  <tr key={exam.id}>
+                    <td title={exam.title}>
+                      <span className="truncate-line">{exam.title}</span>
+                    </td>
+                    <td className="mono">{exam.id}</td>
+                    <td>{exam.published ? 'Published' : 'Draft'}</td>
+                    <td>{exam.maxAttempts ?? 3}</td>
+                    <td>{exam.questionCount}</td>
+                    <td>{exam.availableQuestionCount ?? 0}</td>
+                    <td title={(exam.allowedClasses ?? []).join(', ')}>
+                      <span className="truncate-line">{(exam.allowedClasses ?? []).join(', ')}</span>
+                    </td>
+                  </tr>
+                ))}
+                {!exams.length && (
+                  <tr>
+                    <td colSpan={7}>No exams available.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </article>
       </section>
       )}
 
@@ -1286,6 +2938,7 @@ function AdminPage() {
               <thead>
                 <tr>
                   <th>ID</th>
+                  <th>Source Exam</th>
                   <th>Topic</th>
                   <th>Type</th>
                   <th>Question</th>
@@ -1297,6 +2950,9 @@ function AdminPage() {
                   <tr key={question.id}>
                     <td className="mono" title={question.id}>
                       <span className="truncate-line">{question.id}</span>
+                    </td>
+                    <td title={question.sourceExamId ?? 'general'}>
+                      <span className="truncate-line">{question.sourceExamId ?? 'general'}</span>
                     </td>
                     <td title={question.topic}>
                       <span className="truncate-line">{question.topic}</span>
@@ -1312,7 +2968,7 @@ function AdminPage() {
                 ))}
                 {!questions.length && (
                   <tr>
-                    <td colSpan={5}>No questions available.</td>
+                    <td colSpan={6}>No questions available.</td>
                   </tr>
                 )}
               </tbody>

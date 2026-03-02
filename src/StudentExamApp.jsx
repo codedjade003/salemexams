@@ -1,61 +1,64 @@
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
+  changeStudentPassword,
   fetchMeta,
   fetchSession,
+  fetchStudentMe,
+  fetchStudentTrial,
   logViolation,
   markSeen,
+  requestStudentPasswordHelp,
   saveAnswer,
   saveExamFeedback,
   saveFlag,
   startSession,
+  studentLogin,
   submitExam,
 } from './api';
 
 const ACTIVE_SESSION_KEY = 'salem_exam_active_session';
 const ACTIVE_INDEX_KEY = 'salem_exam_active_index';
+const STUDENT_TOKEN_KEY = 'salem_student_token';
+const STUDENT_TOKEN_EXPIRES_KEY = 'salem_student_token_expires_at';
 
 const TOUR_STEPS = [
   {
     selector: '.tour-timer',
     dock: 'bottom',
     title: 'Timer',
-    text: 'You have 25 minutes. Exam will submit automatically when time is 00:00.',
+    text: 'Your exam auto-submits at 00:00.',
   },
   {
     selector: '.tour-violation',
     dock: 'bottom',
     title: 'Violation Counter',
-    text: 'Tab switch, leaving fullscreen, and blocked keys are logged. Each violation can reduce marks.',
+    text: 'Violations are logged and can reduce marks.',
   },
   {
     selector: '.tour-question',
     dock: 'bottom',
     title: 'Question Area',
-    text: 'Read one question at a time and choose your answer. Use clear answer if needed.',
+    text: 'Read one question at a time and choose answer(s).',
   },
   {
     selector: '.tour-palette',
     dock: 'top',
     title: 'Question Palette',
-    text: 'Use this menu to jump to any of your 40 questions. Colors show answer status.',
+    text: 'Jump to any question using this menu.',
   },
 ];
 
 function formatTime(totalSeconds) {
-  const safeSeconds = Math.max(0, totalSeconds);
-  const minutes = Math.floor(safeSeconds / 60)
-    .toString()
-    .padStart(2, '0');
-  const seconds = (safeSeconds % 60).toString().padStart(2, '0');
-  return `${minutes}:${seconds}`;
+  const safe = Math.max(0, totalSeconds || 0);
+  const mm = String(Math.floor(safe / 60)).padStart(2, '0');
+  const ss = String(safe % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
 }
 
 function formatDateTime(value) {
-  if (!value) {
-    return '-';
-  }
-
+  if (!value) return '-';
   try {
     return new Date(value).toLocaleString();
   } catch {
@@ -64,30 +67,42 @@ function formatDateTime(value) {
 }
 
 function getQuestionStatus(questionId, seen, responses, flagged) {
-  if (!seen[questionId]) {
-    return 'unread';
-  }
-
-  if (flagged[questionId]) {
-    return 'flagged';
-  }
-
+  if (!seen[questionId]) return 'unread';
+  if (flagged[questionId]) return 'flagged';
   return (responses[questionId] ?? []).length > 0 ? 'answered' : 'unanswered';
 }
 
 function StudentExamApp() {
   const [meta, setMeta] = useState(null);
   const [phase, setPhase] = useState('loading');
-  const [setupForm, setSetupForm] = useState({ fullName: '', classRoom: '', email: '' });
+  const [authToken, setAuthToken] = useState('');
+  const [authExpiresAt, setAuthExpiresAt] = useState(0);
+  const [dashboard, setDashboard] = useState(null);
+
+  const [loginForm, setLoginForm] = useState({ fullName: '', classRoom: '', email: '', password: '' });
+  const [helpForm, setHelpForm] = useState({ fullName: '', classRoom: '', email: '', message: '' });
+  const [changePasswordForm, setChangePasswordForm] = useState({
+    currentPassword: '',
+    newPassword: '',
+    confirmPassword: '',
+  });
+
+  const [selectedExamId, setSelectedExamId] = useState('');
   const [session, setSession] = useState(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [tourRunning, setTourRunning] = useState(false);
   const [tourIndex, setTourIndex] = useState(0);
+  const [trialReview, setTrialReview] = useState(null);
+
   const [infoMessage, setInfoMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSavingFeedback, setIsSavingFeedback] = useState(false);
+  const [isSavingPassword, setIsSavingPassword] = useState(false);
+  const [isSendingHelp, setIsSendingHelp] = useState(false);
+  const [isReviewLoading, setIsReviewLoading] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
   const [feedbackForm, setFeedbackForm] = useState({ rating: '', comment: '' });
 
@@ -99,28 +114,87 @@ function StudentExamApp() {
     localStorage.removeItem(ACTIVE_INDEX_KEY);
   }, []);
 
-  const adoptSessionFromError = useCallback(
+  const storeToken = useCallback((token, expiresAt) => {
+    localStorage.setItem(STUDENT_TOKEN_KEY, token);
+    localStorage.setItem(STUDENT_TOKEN_EXPIRES_KEY, String(expiresAt));
+    setAuthToken(token);
+    setAuthExpiresAt(expiresAt);
+  }, []);
+
+  const clearAuth = useCallback(() => {
+    localStorage.removeItem(STUDENT_TOKEN_KEY);
+    localStorage.removeItem(STUDENT_TOKEN_EXPIRES_KEY);
+    setAuthToken('');
+    setAuthExpiresAt(0);
+    setDashboard(null);
+    setSession(null);
+    setSelectedExamId('');
+    setCurrentIndex(0);
+    clearStoredSession();
+  }, [clearStoredSession]);
+
+  const handleUnauthorized = useCallback(
     (error) => {
-      const serverSession = error?.payload?.session;
-      if (!serverSession) {
+      if (!error || (error.status !== 401 && error.status !== 403)) {
         return false;
       }
-
-      setSession(serverSession);
-      setSetupForm({
-        fullName: serverSession.student?.fullName ?? '',
-        classRoom: serverSession.student?.classRoom ?? '',
-        email: serverSession.student?.email ?? '',
-      });
-
-      if (serverSession.submittedAt) {
-        clearStoredSession();
-        setPhase('result');
-      }
-
+      clearAuth();
+      setPhase('setup');
+      setErrorMessage('Your session expired. Login again.');
       return true;
     },
-    [clearStoredSession]
+    [clearAuth]
+  );
+
+  const refreshDashboard = useCallback(async (token) => {
+    if (!token) return null;
+    const payload = await fetchStudentMe(token);
+    const nextDashboard = {
+      user: payload.user,
+      exams: payload.exams ?? [],
+      activeSession: payload.activeSession ?? null,
+      trials: payload.trials ?? [],
+    };
+    setDashboard(nextDashboard);
+    setSelectedExamId((prev) => {
+      const same = nextDashboard.exams.find((exam) => exam.id === prev);
+      if (same) return prev;
+      return nextDashboard.exams.find((exam) => exam.id === 'general')?.id ?? nextDashboard.exams[0]?.id ?? '';
+    });
+    return nextDashboard;
+  }, []);
+
+  const applyServerSession = useCallback(
+    async (serverSession) => {
+      if (!serverSession) return;
+      setSession(serverSession);
+      setSelectedExamId(serverSession.exam?.id ?? '');
+      if (serverSession.submittedAt || serverSession.remainingSeconds <= 0) {
+        clearStoredSession();
+        setPhase('result');
+      } else {
+        localStorage.setItem(ACTIVE_SESSION_KEY, serverSession.sessionId);
+        setPhase('exam');
+      }
+      if (authToken) {
+        try {
+          await refreshDashboard(authToken);
+        } catch {
+          // best effort
+        }
+      }
+    },
+    [authToken, clearStoredSession, refreshDashboard]
+  );
+
+  const adoptSessionFromError = useCallback(
+    async (error) => {
+      const serverSession = error?.payload?.session;
+      if (!serverSession) return false;
+      await applyServerSession(serverSession);
+      return true;
+    },
+    [applyServerSession]
   );
 
   useEffect(() => {
@@ -129,75 +203,83 @@ function StudentExamApp() {
     async function bootstrap() {
       try {
         const metadata = await fetchMeta();
-        if (!alive) {
-          return;
-        }
-
+        if (!alive) return;
         setMeta(metadata);
 
-        const savedSessionId = localStorage.getItem(ACTIVE_SESSION_KEY);
-        if (!savedSessionId) {
+        const savedToken = localStorage.getItem(STUDENT_TOKEN_KEY) ?? '';
+        const savedExpiresAt = Number(localStorage.getItem(STUDENT_TOKEN_EXPIRES_KEY) ?? '0');
+        const tokenValid = savedToken && Number.isFinite(savedExpiresAt) && savedExpiresAt > Date.now();
+
+        if (!tokenValid) {
           setPhase('setup');
           return;
         }
 
+        storeToken(savedToken, savedExpiresAt);
         try {
-          const existing = await fetchSession(savedSessionId);
-          if (!alive) {
+          const next = await refreshDashboard(savedToken);
+          if (!alive) return;
+
+          if (next?.user) {
+            setLoginForm((prev) => ({
+              ...prev,
+              fullName: next.user.fullName ?? '',
+              classRoom: next.user.classRoom ?? '',
+              email: next.user.email ?? '',
+              password: '',
+            }));
+            setHelpForm((prev) => ({
+              ...prev,
+              fullName: next.user.fullName ?? '',
+              classRoom: next.user.classRoom ?? '',
+              email: next.user.email ?? '',
+            }));
+          }
+
+          if (next?.activeSession) {
+            await applyServerSession(next.activeSession);
+            setInfoMessage('Resumed your active exam session.');
             return;
           }
 
-          setSession(existing);
-          setSetupForm({
-            fullName: existing.student?.fullName ?? '',
-            classRoom: existing.student?.classRoom ?? '',
-            email: existing.student?.email ?? '',
-          });
-
-          const storedIndex = Number(localStorage.getItem(ACTIVE_INDEX_KEY) ?? '0');
-          const boundedIndex = Number.isFinite(storedIndex)
-            ? Math.min(Math.max(0, storedIndex), Math.max(0, existing.questions.length - 1))
-            : 0;
-          setCurrentIndex(boundedIndex);
-
-          if (existing.submittedAt || existing.remainingSeconds <= 0) {
-            clearStoredSession();
-            setPhase('result');
-          } else {
-            setInfoMessage('Resumed your active exam session.');
-            setPhase('exam');
+          const savedSessionId = localStorage.getItem(ACTIVE_SESSION_KEY);
+          if (savedSessionId) {
+            try {
+              const existing = await fetchSession(savedToken, savedSessionId);
+              if (!alive) return;
+              await applyServerSession(existing);
+              return;
+            } catch {
+              clearStoredSession();
+            }
           }
-        } catch {
-          clearStoredSession();
+
+          setPhase('setup');
+        } catch (error) {
+          if (!alive) return;
+          clearAuth();
+          if (!handleUnauthorized(error)) {
+            setErrorMessage(error.message || 'Could not load student dashboard.');
+          }
           setPhase('setup');
         }
       } catch (error) {
-        if (!alive) {
-          return;
-        }
-
+        if (!alive) return;
         setErrorMessage(error.message || 'Could not load exam settings.');
         setPhase('error');
       }
     }
 
     bootstrap();
-
     return () => {
       alive = false;
     };
-  }, [clearStoredSession]);
+  }, [applyServerSession, clearAuth, clearStoredSession, handleUnauthorized, refreshDashboard, storeToken]);
 
   useEffect(() => {
-    if (!infoMessage) {
-      return undefined;
-    }
-
-    const timeoutId = setTimeout(() => {
-      setInfoMessage('');
-    }, 3200);
-
-    return () => clearTimeout(timeoutId);
+    if (!infoMessage) return undefined;
+    const id = setTimeout(() => setInfoMessage(''), 3200);
+    return () => clearTimeout(id);
   }, [infoMessage]);
 
   useEffect(() => {
@@ -207,14 +289,9 @@ function StudentExamApp() {
   }, [session?.feedback?.comment, session?.feedback?.rating, session?.sessionId]);
 
   useEffect(() => {
-    const onFullscreenChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement));
-    };
-
-    document.addEventListener('fullscreenchange', onFullscreenChange);
-    return () => {
-      document.removeEventListener('fullscreenchange', onFullscreenChange);
-    };
+    const onChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener('fullscreenchange', onChange);
+    return () => document.removeEventListener('fullscreenchange', onChange);
   }, []);
 
   useEffect(() => {
@@ -222,138 +299,101 @@ function StudentExamApp() {
       clearStoredSession();
       return;
     }
-
     localStorage.setItem(ACTIVE_SESSION_KEY, session.sessionId);
   }, [clearStoredSession, session]);
 
   useEffect(() => {
-    if (phase !== 'exam') {
-      return;
-    }
-
+    if (phase !== 'exam') return;
     localStorage.setItem(ACTIVE_INDEX_KEY, String(currentIndex));
   }, [phase, currentIndex]);
 
   useEffect(() => {
-    if (phase !== 'exam' || !session?.sessionId || session.submittedAt) {
-      return undefined;
-    }
+    if (phase !== 'exam' || !session?.sessionId || session.submittedAt) return undefined;
 
-    const intervalId = setInterval(() => {
-      setSession((previous) => {
-        if (!previous || previous.submittedAt) {
-          return previous;
-        }
-
-        const nextRemaining = Math.max(0, Math.ceil((previous.expiresAt - Date.now()) / 1000));
-        if (nextRemaining === previous.remainingSeconds) {
-          return previous;
-        }
-
-        return {
-          ...previous,
-          remainingSeconds: nextRemaining,
-        };
+    const id = setInterval(() => {
+      setSession((prev) => {
+        if (!prev || prev.submittedAt) return prev;
+        const nextRemaining = Math.max(0, Math.ceil((prev.expiresAt - Date.now()) / 1000));
+        if (nextRemaining === prev.remainingSeconds) return prev;
+        return { ...prev, remainingSeconds: nextRemaining };
       });
     }, 1000);
 
-    return () => clearInterval(intervalId);
+    return () => clearInterval(id);
   }, [phase, session?.sessionId, session?.submittedAt]);
+
+  const activeQuestion = useMemo(() => {
+    if (!session?.questions?.length) return null;
+    return session.questions[currentIndex] ?? null;
+  }, [currentIndex, session]);
+
+  const selectedExam = useMemo(
+    () => dashboard?.exams?.find((exam) => exam.id === selectedExamId) ?? null,
+    [dashboard?.exams, selectedExamId]
+  );
 
   const handleSubmit = useCallback(
     async (trigger = 'manual') => {
-      if (!session || isSubmitting) {
-        return;
-      }
-
+      if (!session || isSubmitting || !authToken) return;
       if (trigger === 'manual') {
         const ok = window.confirm('Submit exam now? You cannot edit answers after submitting.');
-        if (!ok) {
-          return;
-        }
+        if (!ok) return;
       }
 
       setIsSubmitting(true);
       setErrorMessage('');
-
       try {
-        const payload = await submitExam(session.sessionId);
+        const payload = await submitExam(authToken, session.sessionId);
         setSession(payload.session);
         setPhase('result');
         clearStoredSession();
-
+        void refreshDashboard(authToken);
         if (document.fullscreenElement) {
           await document.exitFullscreen().catch(() => undefined);
         }
       } catch (error) {
-        if (!adoptSessionFromError(error)) {
+        if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
           setErrorMessage(error.message || 'Could not submit exam right now.');
         }
       } finally {
         setIsSubmitting(false);
       }
     },
-    [adoptSessionFromError, clearStoredSession, isSubmitting, session]
+    [
+      adoptSessionFromError,
+      authToken,
+      clearStoredSession,
+      handleUnauthorized,
+      isSubmitting,
+      refreshDashboard,
+      session,
+    ]
   );
 
   useEffect(() => {
-    if (phase !== 'exam' || !session || session.submittedAt) {
-      return;
-    }
-
-    if (session.remainingSeconds > 0 || autoSubmitTriggeredRef.current) {
-      return;
-    }
-
+    if (phase !== 'exam' || !session || session.submittedAt) return;
+    if (session.remainingSeconds > 0 || autoSubmitTriggeredRef.current) return;
     autoSubmitTriggeredRef.current = true;
     setInfoMessage('Time is up. Submitting your exam now...');
     void handleSubmit('auto');
   }, [handleSubmit, phase, session]);
 
-  const activeQuestion = useMemo(() => {
-    if (!session || !session.questions?.length) {
-      return null;
-    }
-    return session.questions[currentIndex] ?? null;
-  }, [currentIndex, session]);
-  const activeTourStep = tourRunning ? TOUR_STEPS[tourIndex] ?? null : null;
-
   useEffect(() => {
-    if (phase !== 'exam' || !session || !activeQuestion) {
-      return;
-    }
-
+    if (phase !== 'exam' || !session || !activeQuestion || !authToken) return;
     const questionId = activeQuestion.id;
-    if (session.seen[questionId]) {
-      return;
-    }
+    if (session.seen[questionId]) return;
 
-    setSession((previous) => {
-      if (!previous) {
-        return previous;
-      }
+    setSession((prev) => (prev ? { ...prev, seen: { ...prev.seen, [questionId]: true } } : prev));
 
-      return {
-        ...previous,
-        seen: {
-          ...previous.seen,
-          [questionId]: true,
-        },
-      };
-    });
-
-    void markSeen(session.sessionId, questionId).catch((error) => {
-      if (!adoptSessionFromError(error)) {
+    void markSeen(authToken, session.sessionId, questionId).catch(async (error) => {
+      if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not save read status.');
       }
     });
-  }, [activeQuestion, adoptSessionFromError, phase, session]);
+  }, [activeQuestion, adoptSessionFromError, authToken, handleUnauthorized, phase, session]);
 
   const startExamFullscreen = useCallback(async () => {
-    if (document.fullscreenElement) {
-      return;
-    }
-
+    if (document.fullscreenElement) return;
     await document.documentElement.requestFullscreen().catch(() => {
       setInfoMessage('Please click "Go Full Screen" if full screen did not start.');
     });
@@ -361,91 +401,49 @@ function StudentExamApp() {
 
   const reportViolation = useCallback(
     (type, detail) => {
-      if (!session || session.submittedAt || phase !== 'exam') {
-        return;
-      }
-
+      if (!session || session.submittedAt || phase !== 'exam' || !authToken) return;
       const now = Date.now();
       const recent = violationThrottleRef.current.get(type) ?? 0;
-      if (now - recent < 2000) {
-        return;
-      }
-
+      if (now - recent < 2000) return;
       violationThrottleRef.current.set(type, now);
 
-      setSession((previous) => {
-        if (!previous) {
-          return previous;
-        }
-
-        return {
-          ...previous,
-          violations: [
-            ...previous.violations,
-            {
-              id: `local-${now}`,
-              type,
-              detail,
-              occurredAt: now,
-            },
-          ],
-        };
-      });
-
-      setInfoMessage(`Violation logged: ${detail}`);
-
-      void logViolation(session.sessionId, type, detail)
-        .then((payload) => {
-          if (!payload?.violations) {
-            return;
-          }
-
-          setSession((previous) => {
-            if (!previous) {
-              return previous;
+      setSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              violations: [...prev.violations, { id: `local-${now}`, type, detail, occurredAt: now }],
             }
+          : prev
+      );
 
-            return {
-              ...previous,
-              violations: payload.violations,
-            };
-          });
+      void logViolation(authToken, session.sessionId, type, detail)
+        .then((payload) => {
+          if (!payload?.violations) return;
+          setSession((prev) => (prev ? { ...prev, violations: payload.violations } : prev));
         })
-        .catch((error) => {
-          if (!adoptSessionFromError(error)) {
+        .catch(async (error) => {
+          if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
             setErrorMessage(error.message || 'Could not sync proctoring log.');
           }
         });
     },
-    [adoptSessionFromError, phase, session]
+    [adoptSessionFromError, authToken, handleUnauthorized, phase, session]
   );
 
   useEffect(() => {
-    if (phase !== 'exam' || !session || session.submittedAt) {
-      return undefined;
-    }
+    if (phase !== 'exam' || !session || session.submittedAt) return undefined;
 
     const onVisibilityChange = () => {
-      if (document.hidden) {
-        reportViolation('tab_switch', 'You left the exam tab');
-      }
+      if (document.hidden) reportViolation('tab_switch', 'You left the exam tab');
     };
-
-    const onWindowBlur = () => {
-      reportViolation('window_blur', 'Exam window lost focus');
-    };
-
+    const onWindowBlur = () => reportViolation('window_blur', 'Exam window lost focus');
     const onFullscreenExit = () => {
-      if (!document.fullscreenElement) {
-        reportViolation('fullscreen_exit', 'You exited full screen mode');
-      }
+      if (!document.fullscreenElement) reportViolation('fullscreen_exit', 'You exited full screen mode');
     };
-
     const onContextMenu = (event) => {
       event.preventDefault();
       reportViolation('right_click', 'Right click is blocked during exam');
     };
-
     const onKeyDown = (event) => {
       const key = event.key.toLowerCase();
       const blocked =
@@ -454,11 +452,7 @@ function StudentExamApp() {
         (event.ctrlKey && event.shiftKey && ['i', 'j', 'c'].includes(key)) ||
         (event.ctrlKey && ['u', 's', 'c', 'v', 'x', 'p'].includes(key)) ||
         (event.metaKey && ['c', 'v', 'x', 's', 'p'].includes(key));
-
-      if (!blocked) {
-        return;
-      }
-
+      if (!blocked) return;
       event.preventDefault();
       reportViolation('restricted_key', `Blocked key: ${event.key}`);
     };
@@ -479,30 +473,20 @@ function StudentExamApp() {
   }, [phase, reportViolation, session]);
 
   useEffect(() => {
-    if (!tourRunning || phase !== 'exam') {
-      return undefined;
-    }
-
+    if (!tourRunning || phase !== 'exam') return undefined;
     const step = TOUR_STEPS[tourIndex];
-    if (!step) {
-      return undefined;
-    }
-
+    if (!step) return undefined;
     const target = document.querySelector(step.selector);
-    if (!target) {
-      return undefined;
-    }
+    if (!target) return undefined;
 
     target.setAttribute('data-tour-active', 'true');
     target.scrollIntoView({
       behavior: 'smooth',
-      block: step.dock === 'top' ? 'end' : 'center',
+      block: step.dock === 'top' ? 'start' : 'center',
       inline: 'nearest',
     });
 
-    return () => {
-      target.removeAttribute('data-tour-active');
-    };
+    return () => target.removeAttribute('data-tour-active');
   }, [phase, tourIndex, tourRunning]);
 
   const finishTour = useCallback(() => {
@@ -510,25 +494,75 @@ function StudentExamApp() {
     setTourIndex(0);
   }, []);
 
-  const handleStartSession = async (event) => {
+  const handleLogin = async (event) => {
     event.preventDefault();
-    if (!meta) {
-      return;
-    }
+    setErrorMessage('');
+    setIsLoggingIn(true);
 
+    try {
+      const payload = await studentLogin(loginForm);
+      storeToken(payload.token, payload.expiresAt);
+      const nextDashboard = {
+        user: payload.user,
+        exams: payload.exams ?? [],
+        activeSession: payload.activeSession ?? null,
+        trials: payload.trials ?? [],
+      };
+      setDashboard(nextDashboard);
+      setSelectedExamId(
+        nextDashboard.exams.find((exam) => exam.id === 'general')?.id ?? nextDashboard.exams[0]?.id ?? ''
+      );
+      setHelpForm((prev) => ({
+        ...prev,
+        fullName: loginForm.fullName,
+        classRoom: loginForm.classRoom,
+        email: loginForm.email,
+      }));
+      setLoginForm((prev) => ({ ...prev, password: '' }));
+      setChangePasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setInfoMessage('Login successful.');
+
+      if (payload.activeSession) {
+        await applyServerSession(payload.activeSession);
+      } else {
+        setPhase('setup');
+      }
+    } catch (error) {
+      setErrorMessage(error.message || 'Could not login.');
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = () => {
+    clearAuth();
+    setPhase('setup');
+    setTourRunning(false);
+    setTourIndex(0);
+    setTrialReview(null);
+    autoSubmitTriggeredRef.current = false;
+    setInfoMessage('Logged out.');
+  };
+
+  const handleStartSession = async () => {
+    if (!authToken || !selectedExamId || isStarting) return;
     setErrorMessage('');
     setIsStarting(true);
 
     try {
-      const created = await startSession(setupForm);
+      const created = await startSession(authToken, { examId: selectedExamId });
       autoSubmitTriggeredRef.current = false;
       setSession(created);
       setCurrentIndex(0);
       setPhase('instructions');
       localStorage.setItem(ACTIVE_SESSION_KEY, created.sessionId);
       localStorage.setItem(ACTIVE_INDEX_KEY, '0');
+      await refreshDashboard(authToken);
     } catch (error) {
-      setErrorMessage(error.message || 'Could not start exam session.');
+      if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
+        setErrorMessage(error.message || 'Could not start exam session.');
+      }
+      void refreshDashboard(authToken);
     } finally {
       setIsStarting(false);
     }
@@ -542,9 +576,7 @@ function StudentExamApp() {
   };
 
   const handlePickOption = (question, optionId) => {
-    if (!session) {
-      return;
-    }
+    if (!session || !authToken) return;
 
     const previous = session.responses[question.id] ?? [];
     const selected =
@@ -554,108 +586,98 @@ function StudentExamApp() {
           ? previous.filter((id) => id !== optionId)
           : [...previous, optionId];
 
-    setSession((current) => {
-      if (!current) {
-        return current;
-      }
+    setSession((current) =>
+      current
+        ? {
+            ...current,
+            responses: {
+              ...current.responses,
+              [question.id]: selected,
+            },
+          }
+        : current
+    );
 
-      return {
-        ...current,
-        responses: {
-          ...current.responses,
-          [question.id]: selected,
-        },
-      };
-    });
-
-    void saveAnswer(session.sessionId, question.id, selected).catch((error) => {
-      if (!adoptSessionFromError(error)) {
+    void saveAnswer(authToken, session.sessionId, question.id, selected).catch(async (error) => {
+      if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not save answer.');
       }
     });
   };
 
   const handleClearAnswer = () => {
-    if (!session || !activeQuestion) {
-      return;
-    }
+    if (!session || !activeQuestion || !authToken) return;
 
-    setSession((current) => {
-      if (!current) {
-        return current;
-      }
+    setSession((current) =>
+      current
+        ? {
+            ...current,
+            responses: {
+              ...current.responses,
+              [activeQuestion.id]: [],
+            },
+          }
+        : current
+    );
 
-      return {
-        ...current,
-        responses: {
-          ...current.responses,
-          [activeQuestion.id]: [],
-        },
-      };
-    });
-
-    void saveAnswer(session.sessionId, activeQuestion.id, []).catch((error) => {
-      if (!adoptSessionFromError(error)) {
+    void saveAnswer(authToken, session.sessionId, activeQuestion.id, []).catch(async (error) => {
+      if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not clear answer.');
       }
     });
   };
 
   const handleToggleFlag = () => {
-    if (!session || !activeQuestion) {
-      return;
-    }
+    if (!session || !activeQuestion || !authToken) return;
 
     const nextFlagged = !session.flagged[activeQuestion.id];
+    setSession((current) =>
+      current
+        ? {
+            ...current,
+            flagged: {
+              ...current.flagged,
+              [activeQuestion.id]: nextFlagged,
+            },
+          }
+        : current
+    );
 
-    setSession((current) => {
-      if (!current) {
-        return current;
-      }
-
-      return {
-        ...current,
-        flagged: {
-          ...current.flagged,
-          [activeQuestion.id]: nextFlagged,
-        },
-      };
-    });
-
-    void saveFlag(session.sessionId, activeQuestion.id, nextFlagged).catch((error) => {
-      if (!adoptSessionFromError(error)) {
+    void saveFlag(authToken, session.sessionId, activeQuestion.id, nextFlagged).catch(async (error) => {
+      if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not update flag status.');
       }
     });
   };
 
-  const handleStartNewCandidate = () => {
-    clearStoredSession();
-    autoSubmitTriggeredRef.current = false;
+  const handleBackToDashboard = async () => {
     setSession(null);
     setCurrentIndex(0);
     setTourRunning(false);
     setTourIndex(0);
-    setIsSavingFeedback(false);
-    setFeedbackForm({ rating: '', comment: '' });
-    setInfoMessage('');
-    setErrorMessage('');
-    setSetupForm({ fullName: '', classRoom: '', email: '' });
     setPhase('setup');
+    clearStoredSession();
+    autoSubmitTriggeredRef.current = false;
+
+    if (authToken) {
+      try {
+        await refreshDashboard(authToken);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not refresh dashboard.');
+        }
+      }
+    }
   };
 
   const handleSaveFeedback = async (event) => {
     event.preventDefault();
-
-    if (!session?.sessionId || !session.submittedAt || isSavingFeedback) {
-      return;
-    }
+    if (!session?.sessionId || !session.submittedAt || isSavingFeedback || !authToken) return;
 
     const rating = feedbackForm.rating ? Number(feedbackForm.rating) : null;
     const comment = feedbackForm.comment.trim();
-
     if (!rating && !comment) {
-      setInfoMessage('Feedback skipped. You can still start another candidate.');
+      setInfoMessage('Feedback skipped.');
       return;
     }
 
@@ -663,20 +685,84 @@ function StudentExamApp() {
     setErrorMessage('');
 
     try {
-      const payload = await saveExamFeedback(session.sessionId, { rating, comment });
+      const payload = await saveExamFeedback(authToken, session.sessionId, { rating, comment });
       if (payload?.session) {
         setSession(payload.session);
       } else if (payload?.feedback) {
         setSession((previous) => (previous ? { ...previous, feedback: payload.feedback } : previous));
       }
-
       setInfoMessage('Thanks. Feedback saved.');
+      await refreshDashboard(authToken);
     } catch (error) {
-      if (!adoptSessionFromError(error)) {
+      if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not save feedback right now.');
       }
     } finally {
       setIsSavingFeedback(false);
+    }
+  };
+
+  const handleSendPasswordHelp = async (event) => {
+    event.preventDefault();
+    setErrorMessage('');
+    setIsSendingHelp(true);
+
+    try {
+      await requestStudentPasswordHelp(helpForm);
+      setHelpForm((prev) => ({ ...prev, message: '' }));
+      setInfoMessage('Help request sent to admin.');
+    } catch (error) {
+      setErrorMessage(error.message || 'Could not send password-help request.');
+    } finally {
+      setIsSendingHelp(false);
+    }
+  };
+
+  const handleChangePassword = async (event) => {
+    event.preventDefault();
+    if (!authToken) return;
+    if (!changePasswordForm.currentPassword || !changePasswordForm.newPassword) {
+      setErrorMessage('Enter current password and a new password.');
+      return;
+    }
+    if (changePasswordForm.newPassword !== changePasswordForm.confirmPassword) {
+      setErrorMessage('New password and confirmation do not match.');
+      return;
+    }
+
+    setErrorMessage('');
+    setIsSavingPassword(true);
+
+    try {
+      await changeStudentPassword(authToken, {
+        currentPassword: changePasswordForm.currentPassword,
+        newPassword: changePasswordForm.newPassword,
+      });
+      setChangePasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setInfoMessage('Password changed successfully.');
+      await refreshDashboard(authToken);
+    } catch (error) {
+      if (!handleUnauthorized(error)) {
+        setErrorMessage(error.message || 'Could not change password.');
+      }
+    } finally {
+      setIsSavingPassword(false);
+    }
+  };
+
+  const handleOpenTrialReview = async (trialId) => {
+    if (!authToken || !trialId) return;
+    setIsReviewLoading(true);
+    setErrorMessage('');
+    try {
+      const payload = await fetchStudentTrial(authToken, trialId);
+      setTrialReview(payload.trial);
+    } catch (error) {
+      if (!handleUnauthorized(error)) {
+        setErrorMessage(error.message || 'Could not load trial review.');
+      }
+    } finally {
+      setIsReviewLoading(false);
     }
   };
 
@@ -706,64 +792,299 @@ function StudentExamApp() {
   }
 
   if (phase === 'setup') {
+    if (!authToken) {
+      return (
+        <main className="center-screen">
+          <div className="card-panel wide">
+            <h1>Salem Academy CBT</h1>
+            <p className="muted">
+              Login with your details. First password is your full name joined in lowercase.
+            </p>
+
+            <form onSubmit={handleLogin} className="form-stack">
+              <label htmlFor="fullName">Full Name</label>
+              <input
+                id="fullName"
+                required
+                minLength={5}
+                value={loginForm.fullName}
+                onChange={(event) => setLoginForm((prev) => ({ ...prev, fullName: event.target.value }))}
+              />
+
+              <label htmlFor="classRoom">Class</label>
+              <select
+                id="classRoom"
+                required
+                value={loginForm.classRoom}
+                onChange={(event) => setLoginForm((prev) => ({ ...prev, classRoom: event.target.value }))}
+              >
+                <option value="">Select class</option>
+                {meta?.classOptions?.map((classOption) => (
+                  <option key={classOption} value={classOption}>
+                    {classOption}
+                  </option>
+                ))}
+              </select>
+
+              <label htmlFor="email">Email</label>
+              <input
+                id="email"
+                type="email"
+                required
+                value={loginForm.email}
+                onChange={(event) => setLoginForm((prev) => ({ ...prev, email: event.target.value }))}
+              />
+
+              <label htmlFor="password">Password</label>
+              <input
+                id="password"
+                type="password"
+                required
+                value={loginForm.password}
+                onChange={(event) => setLoginForm((prev) => ({ ...prev, password: event.target.value }))}
+              />
+
+              {errorMessage && <p className="error-text">{errorMessage}</p>}
+
+              <button type="submit" className="btn btn-primary" disabled={isLoggingIn}>
+                {isLoggingIn ? 'Signing In...' : 'Login'}
+              </button>
+            </form>
+
+            <details className="feedback-panel">
+              <summary>
+                <strong>Forgot password? Request admin help</strong>
+              </summary>
+
+              <form className="form-stack" onSubmit={handleSendPasswordHelp}>
+                <label htmlFor="helpFullName">Full Name</label>
+                <input
+                  id="helpFullName"
+                  required
+                  value={helpForm.fullName}
+                  onChange={(event) => setHelpForm((prev) => ({ ...prev, fullName: event.target.value }))}
+                />
+
+                <label htmlFor="helpClass">Class</label>
+                <select
+                  id="helpClass"
+                  required
+                  value={helpForm.classRoom}
+                  onChange={(event) => setHelpForm((prev) => ({ ...prev, classRoom: event.target.value }))}
+                >
+                  <option value="">Select class</option>
+                  {meta?.classOptions?.map((classOption) => (
+                    <option key={classOption} value={classOption}>
+                      {classOption}
+                    </option>
+                  ))}
+                </select>
+
+                <label htmlFor="helpEmail">Email</label>
+                <input
+                  id="helpEmail"
+                  type="email"
+                  required
+                  value={helpForm.email}
+                  onChange={(event) => setHelpForm((prev) => ({ ...prev, email: event.target.value }))}
+                />
+
+                <label htmlFor="helpMessage">Message (Optional)</label>
+                <textarea
+                  id="helpMessage"
+                  rows={3}
+                  value={helpForm.message}
+                  onChange={(event) => setHelpForm((prev) => ({ ...prev, message: event.target.value }))}
+                />
+
+                <button type="submit" className="btn btn-outline" disabled={isSendingHelp}>
+                  {isSendingHelp ? 'Sending...' : 'Send Help Request'}
+                </button>
+              </form>
+            </details>
+          </div>
+        </main>
+      );
+    }
+
     return (
       <main className="center-screen">
-        <div className="card-panel">
-          <h1>Salem Academy CBT</h1>
-          <p className="muted">Student Login</p>
+        <div className="card-panel wide">
+          <h1>Student Dashboard</h1>
+          <p>
+            <strong>{dashboard?.user?.fullName}</strong> | {dashboard?.user?.classRoom} | {dashboard?.user?.email}
+          </p>
+          <p className="muted">
+            Session expires: <strong>{formatDateTime(authExpiresAt)}</strong>
+          </p>
+          {dashboard?.user?.mustChangePassword && (
+            <p className="error-text">Please change your password now for account security.</p>
+          )}
 
-          <form onSubmit={handleStartSession} className="form-stack">
-            <label htmlFor="fullName">Full Name</label>
-            <input
-              id="fullName"
-              name="fullName"
-              type="text"
-              required
-              minLength={5}
-              value={setupForm.fullName}
-              onChange={(event) =>
-                setSetupForm((previous) => ({ ...previous, fullName: event.target.value }))
-              }
-              placeholder="Example: Ada Bright James"
-            />
+          <div className="feedback-panel">
+            <h3>Start Exam</h3>
+            <div className="form-stack">
+              <label htmlFor="examId">Exam</label>
+              <select id="examId" value={selectedExamId} onChange={(event) => setSelectedExamId(event.target.value)}>
+                <option value="">Select exam</option>
+                {(dashboard?.exams ?? []).map((exam) => (
+                  <option key={exam.id} value={exam.id}>
+                    {exam.title}
+                  </option>
+                ))}
+              </select>
+            </div>
 
-            <label htmlFor="classRoom">Class</label>
-            <select
-              id="classRoom"
-              name="classRoom"
-              required
-              value={setupForm.classRoom}
-              onChange={(event) =>
-                setSetupForm((previous) => ({ ...previous, classRoom: event.target.value }))
-              }
-            >
-              <option value="">Select class</option>
-              {meta?.classOptions?.map((classOption) => (
-                <option key={classOption} value={classOption}>
-                  {classOption}
-                </option>
-              ))}
-            </select>
+            {selectedExam && (
+              <div className="result-grid">
+                <div className="result-box">
+                  <span>Attempts Used</span>
+                  <strong>
+                    {selectedExam.attemptsUsed}/{selectedExam.maxAttempts}
+                  </strong>
+                </div>
+                <div className="result-box">
+                  <span>Attempts Left</span>
+                  <strong>{selectedExam.attemptsRemaining}</strong>
+                </div>
+                <div className="result-box">
+                  <span>Best Score</span>
+                  <strong>{selectedExam.bestFinalPercent ?? 0}%</strong>
+                </div>
+                <div className="result-box">
+                  <span>Duration</span>
+                  <strong>{formatTime(selectedExam.durationSeconds ?? 0)}</strong>
+                </div>
+              </div>
+            )}
 
-            <label htmlFor="email">Email</label>
-            <input
-              id="email"
-              name="email"
-              type="email"
-              required
-              value={setupForm.email}
-              onChange={(event) =>
-                setSetupForm((previous) => ({ ...previous, email: event.target.value }))
-              }
-              placeholder="student@email.com"
-            />
+            <div className="inline-actions">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleStartSession}
+                disabled={isStarting || !selectedExam || !selectedExam.canAttempt}
+              >
+                {isStarting ? 'Starting...' : 'Start New Trial'}
+              </button>
 
-            {errorMessage && <p className="error-text">{errorMessage}</p>}
+              {dashboard?.activeSession && (
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => void applyServerSession(dashboard.activeSession)}
+                >
+                  Resume Active Trial
+                </button>
+              )}
 
-            <button type="submit" className="btn btn-primary" disabled={isStarting}>
-              {isStarting ? 'Creating Session...' : 'Continue'}
-            </button>
+              <button type="button" className="btn btn-outline" onClick={() => void refreshDashboard(authToken)}>
+                Refresh Dashboard
+              </button>
+            </div>
+            {selectedExam && !selectedExam.canAttempt && <p className="error-text">Attempt limit reached.</p>}
+          </div>
+
+          <form className="feedback-panel" onSubmit={handleChangePassword}>
+            <h3>Change Password</h3>
+            <div className="feedback-grid">
+              <div>
+                <label htmlFor="currentPassword">Current Password</label>
+                <input
+                  id="currentPassword"
+                  type="password"
+                  value={changePasswordForm.currentPassword}
+                  onChange={(event) =>
+                    setChangePasswordForm((prev) => ({ ...prev, currentPassword: event.target.value }))
+                  }
+                />
+              </div>
+              <div>
+                <label htmlFor="newPassword">New Password</label>
+                <input
+                  id="newPassword"
+                  type="password"
+                  value={changePasswordForm.newPassword}
+                  onChange={(event) =>
+                    setChangePasswordForm((prev) => ({ ...prev, newPassword: event.target.value }))
+                  }
+                />
+              </div>
+            </div>
+
+            <div className="form-stack">
+              <label htmlFor="confirmPassword">Confirm New Password</label>
+              <input
+                id="confirmPassword"
+                type="password"
+                value={changePasswordForm.confirmPassword}
+                onChange={(event) =>
+                  setChangePasswordForm((prev) => ({ ...prev, confirmPassword: event.target.value }))
+                }
+              />
+            </div>
+
+            <div className="inline-actions">
+              <button type="submit" className="btn btn-outline" disabled={isSavingPassword}>
+                {isSavingPassword ? 'Saving...' : 'Save Password'}
+              </button>
+            </div>
           </form>
+
+          <div className="feedback-panel">
+            <h3>Previous Trials</h3>
+            <div className="table-wrap medium">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Exam</th>
+                    <th>Trial</th>
+                    <th>Status</th>
+                    <th>Final %</th>
+                    <th>Violations</th>
+                    <th>Started</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(dashboard?.trials ?? []).map((trial) => (
+                    <tr key={trial.id}>
+                      <td title={trial.exam?.title}>
+                        <span className="truncate-line">{trial.exam?.title ?? '-'}</span>
+                      </td>
+                      <td>#{trial.trialNumber ?? 1}</td>
+                      <td>{trial.status}</td>
+                      <td>{trial.summary?.finalPercent ?? 0}%</td>
+                      <td>{trial.summary?.totalViolationsCount ?? trial.summary?.violationsCount ?? 0}</td>
+                      <td>{formatDateTime(trial.startedAt)}</td>
+                      <td className="cell-tight">
+                        <button
+                          type="button"
+                          className="btn btn-outline btn-xs"
+                          onClick={() => handleOpenTrialReview(trial.id)}
+                          disabled={isReviewLoading}
+                        >
+                          Review
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {!(dashboard?.trials ?? []).length && (
+                    <tr>
+                      <td colSpan={7}>No trials yet.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {errorMessage && <p className="error-text">{errorMessage}</p>}
+          <div className="inline-actions">
+            <button type="button" className="btn btn-danger" onClick={handleLogout}>
+              Logout
+            </button>
+          </div>
         </div>
       </main>
     );
@@ -775,24 +1096,28 @@ function StudentExamApp() {
         <div className="card-panel wide">
           <h1>Exam Instructions</h1>
           <p>
-            Candidate: <strong>{session?.student.fullName}</strong> | Class:{' '}
-            <strong>{session?.student.classRoom}</strong>
+            Candidate: <strong>{session?.student.fullName}</strong> | Class: <strong>{session?.student.classRoom}</strong>
+          </p>
+          <p>
+            Exam: <strong>{session?.exam?.title ?? 'General Exam Pool'}</strong> | Trial{' '}
+            <strong>
+              #{session?.trialNumber ?? 1}
+              {session?.exam?.maxAttempts ? `/${session.exam.maxAttempts}` : ''}
+            </strong>
           </p>
           <p className="muted">Results will be sent to {session?.student.email} before end of day.</p>
 
           <ul className="rules-list">
-            <li>Total questions: {meta?.questionCount ?? 40}</li>
-            <li>Time allowed: {formatTime(meta?.durationSeconds ?? 1500)}</li>
+            <li>Total questions: {session?.questions?.length ?? meta?.questionCount ?? 40}</li>
+            <li>Time allowed: {formatTime(session?.durationSeconds ?? meta?.durationSeconds ?? 1500)}</li>
             <li>Questions are in random order for each student.</li>
-            <li>One question is shown at a time.</li>
-            <li>Use the bottom palette to jump between questions.</li>
-            <li>Violation warning: each violation reduces score by {meta?.penaltyPerViolation ?? 2}%.</li>
-            <li>Stay in full screen for the whole exam.</li>
+            <li>Use the palette to jump between questions.</li>
+            <li>Violation warning: each active violation can reduce score by {meta?.penaltyPerViolation ?? 2}%.</li>
           </ul>
 
           <div className="inline-actions">
-            <button type="button" className="btn btn-secondary" onClick={handleStartNewCandidate}>
-              Cancel Session
+            <button type="button" className="btn btn-secondary" onClick={() => void handleBackToDashboard()}>
+              Back to Dashboard
             </button>
             <button type="button" className="btn btn-primary" onClick={beginExam}>
               Start Exam
@@ -813,8 +1138,11 @@ function StudentExamApp() {
         <div className="card-panel wide">
           <h1>Exam Submitted</h1>
           <p>
-            Student: <strong>{session.student.fullName}</strong> | Class:{' '}
-            <strong>{session.student.classRoom}</strong>
+            Student: <strong>{session.student.fullName}</strong> | Class: <strong>{session.student.classRoom}</strong>
+          </p>
+          <p>
+            Exam: <strong>{session.exam?.title ?? 'General Exam Pool'}</strong> | Trial{' '}
+            <strong>#{session.trialNumber ?? 1}</strong>
           </p>
 
           <div className="result-grid">
@@ -835,12 +1163,12 @@ function StudentExamApp() {
               <strong>{summary?.rawPercent ?? 0}%</strong>
             </div>
             <div className="result-box">
-              <span>Violations</span>
+              <span>Active Violations</span>
               <strong>{summary?.violationsCount ?? 0}</strong>
             </div>
             <div className="result-box">
-              <span>Penalty</span>
-              <strong>-{summary?.penaltyPoints ?? 0}%</strong>
+              <span>Total Violations</span>
+              <strong>{summary?.totalViolationsCount ?? 0}</strong>
             </div>
             <div className="result-box final">
               <span>Final Score</span>
@@ -849,25 +1177,18 @@ function StudentExamApp() {
           </div>
 
           <p className="muted">
-            Score out of 40: <strong>{summary?.finalScoreOutOf40 ?? 0}</strong>
-          </p>
-          <p className="muted">
             Results will be sent to <strong>{session.student.email}</strong> before end of day.
           </p>
 
           <form className="feedback-panel" onSubmit={handleSaveFeedback}>
             <h3>Optional Rating & Feedback</h3>
-            <p className="muted">Tell us how the exam experience felt for this student.</p>
-
             <div className="feedback-grid">
               <div>
                 <label htmlFor="feedbackRating">Rating (1 to 5)</label>
                 <select
                   id="feedbackRating"
                   value={feedbackForm.rating}
-                  onChange={(event) =>
-                    setFeedbackForm((previous) => ({ ...previous, rating: event.target.value }))
-                  }
+                  onChange={(event) => setFeedbackForm((prev) => ({ ...prev, rating: event.target.value }))}
                 >
                   <option value="">No rating</option>
                   <option value="1">1 - Poor</option>
@@ -883,12 +1204,9 @@ function StudentExamApp() {
                 <textarea
                   id="feedbackComment"
                   value={feedbackForm.comment}
-                  onChange={(event) =>
-                    setFeedbackForm((previous) => ({ ...previous, comment: event.target.value }))
-                  }
+                  onChange={(event) => setFeedbackForm((prev) => ({ ...prev, comment: event.target.value }))}
                   maxLength={600}
                   rows={3}
-                  placeholder="Optional comment"
                 />
               </div>
             </div>
@@ -898,17 +1216,17 @@ function StudentExamApp() {
                 {isSavingFeedback ? 'Saving...' : 'Save Feedback'}
               </button>
               {session.feedback && (
-                <p className="muted">
-                  Saved: {session.feedback.rating ? `${session.feedback.rating}/5` : 'No rating'} at{' '}
-                  {formatDateTime(session.feedback.submittedAt)}
-                </p>
+                <p className="muted">Saved at {formatDateTime(session.feedback.submittedAt)}</p>
               )}
             </div>
           </form>
 
           <div className="inline-actions">
-            <button type="button" className="btn btn-primary" onClick={handleStartNewCandidate}>
-              Start New Candidate
+            <button type="button" className="btn btn-primary" onClick={() => void handleBackToDashboard()}>
+              Back to Dashboard
+            </button>
+            <button type="button" className="btn btn-danger" onClick={handleLogout}>
+              Logout
             </button>
           </div>
         </div>
@@ -935,6 +1253,10 @@ function StudentExamApp() {
           <h1>Salem Academy CBT</h1>
           <p>
             {session?.student.fullName} | {session?.student.classRoom}
+          </p>
+          <p>
+            {session?.exam?.title ?? 'General Exam Pool'} | Trial #{session?.trialNumber ?? 1}
+            {session?.exam?.maxAttempts ? `/${session.exam.maxAttempts}` : ''}
           </p>
         </div>
 
@@ -993,7 +1315,9 @@ function StudentExamApp() {
                   checked={chosen}
                   onChange={() => handlePickOption(activeQuestion, option.id)}
                 />
-                <span className="option-label">{option.id}. {option.text}</span>
+                <span className="option-label">
+                  {option.id}. {option.text}
+                </span>
               </label>
             );
           })}
@@ -1024,11 +1348,7 @@ function StudentExamApp() {
           <button
             type="button"
             className="btn btn-primary"
-            onClick={() =>
-              setCurrentIndex((index) =>
-                Math.min((session?.questions.length ?? 1) - 1, index + 1)
-              )
-            }
+            onClick={() => setCurrentIndex((index) => Math.min((session?.questions.length ?? 1) - 1, index + 1))}
             disabled={currentIndex >= (session?.questions.length ?? 1) - 1}
           >
             Next
@@ -1038,7 +1358,7 @@ function StudentExamApp() {
 
       <section className="palette-panel tour-palette">
         <div className="palette-header">
-          <h3>Question Menu (1 - 40)</h3>
+          <h3>Question Menu</h3>
           <p>Jump to any question</p>
         </div>
 
@@ -1068,12 +1388,14 @@ function StudentExamApp() {
         </div>
       </section>
 
-      {tourRunning && activeTourStep && (
-        <div className={`tour-overlay ${activeTourStep.dock === 'top' ? 'dock-top' : 'dock-bottom'}`}>
+      {tourRunning && (
+        <div className={`tour-overlay ${TOUR_STEPS[tourIndex]?.dock === 'top' ? 'dock-top' : 'dock-bottom'}`}>
           <div className="tour-card">
-            <p className="tour-step">Step {tourIndex + 1} of {TOUR_STEPS.length}</p>
-            <h3>{activeTourStep.title}</h3>
-            <p>{activeTourStep.text}</p>
+            <p className="tour-step">
+              Step {tourIndex + 1} of {TOUR_STEPS.length}
+            </p>
+            <h3>{TOUR_STEPS[tourIndex]?.title}</h3>
+            <p>{TOUR_STEPS[tourIndex]?.text}</p>
 
             <div className="inline-actions">
               <button type="button" className="btn btn-secondary" onClick={finishTour}>
@@ -1091,16 +1413,62 @@ function StudentExamApp() {
                 type="button"
                 className="btn btn-primary"
                 onClick={() => {
-                  if (tourIndex === TOUR_STEPS.length - 1) {
+                  if (tourIndex >= TOUR_STEPS.length - 1) {
                     finishTour();
                     return;
                   }
-
-                  setTourIndex((index) => index + 1);
+                  setTourIndex((index) => Math.min(index + 1, TOUR_STEPS.length - 1));
                 }}
               >
-                {tourIndex === TOUR_STEPS.length - 1 ? 'Finish' : 'Next'}
+                {tourIndex >= TOUR_STEPS.length - 1 ? 'Finish' : 'Next'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {trialReview && (
+        <div className="modal-backdrop" onClick={() => setTrialReview(null)}>
+          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+            <div className="panel-title-row">
+              <h2>
+                Trial Review: {trialReview.exam?.title} #{trialReview.trialNumber}
+              </h2>
+              <button type="button" className="btn btn-outline btn-xs" onClick={() => setTrialReview(null)}>
+                Close
+              </button>
+            </div>
+
+            <div className="table-wrap large">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Question</th>
+                    <th>Selected</th>
+                    <th>Correct</th>
+                    <th>Result</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(trialReview.questionReview ?? []).map((item) => (
+                    <tr key={`${trialReview.id}-${item.questionId}`}>
+                      <td>{item.index}</td>
+                      <td title={item.text}>
+                        <span className="truncate-2">{item.text}</span>
+                      </td>
+                      <td>{(item.selectedOptionIds ?? []).join(', ') || '-'}</td>
+                      <td>{(item.correctOptionIds ?? []).join(', ') || '-'}</td>
+                      <td>{item.isCorrect ? 'Correct' : 'Wrong'}</td>
+                    </tr>
+                  ))}
+                  {!(trialReview.questionReview ?? []).length && (
+                    <tr>
+                      <td colSpan={5}>No review data available.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>

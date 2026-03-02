@@ -1,12 +1,34 @@
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
-import { randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 import { CLASS_OPTIONS, EXAM_DURATION_SECONDS, EXAM_QUESTION_COUNT } from './questions.js';
 import { addQuestion, getQuestionByIdMap, getQuestionPool } from './questionStore.js';
+import {
+  createExam,
+  getExam,
+  listExams,
+  toPublicExam,
+  updateExam,
+} from './examStore.js';
+import {
+  buildUserKey,
+  createPasswordAssistanceRequest,
+  createUserFromDefaultPassword,
+  getUserById,
+  getUserByKey,
+  listPasswordAssistanceRequests,
+  listUsers,
+  resolvePasswordAssistanceRequest,
+  toPublicUserRecord,
+  updateUser,
+  updateUserPassword,
+  touchUserLogin,
+} from './userStore.js';
+import { hashPasswordScrypt, parseScryptHash, verifyPasswordScrypt } from './authUtils.js';
 import {
   deleteSession,
   deleteSessions,
@@ -20,6 +42,7 @@ const PORT = Number(process.env.PORT ?? 4000);
 const PENALTY_PER_VIOLATION = 2;
 const ADMIN_PASSCODE_HASH = process.env.ADMIN_PASSCODE_HASH ?? '';
 const ADMIN_TOKEN_LIFETIME_MS = 12 * 60 * 60 * 1000;
+const STUDENT_TOKEN_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
 const OPTION_IDS = ['A', 'B', 'C', 'D'];
 const KEEP_ALIVE_ENABLED = String(process.env.KEEP_ALIVE_ENABLED ?? 'true').toLowerCase() === 'true';
 const KEEP_ALIVE_URL = String(process.env.KEEP_ALIVE_URL ?? '').trim();
@@ -30,6 +53,7 @@ const KEEP_ALIVE_INTERVAL_MS =
     : 5 * 60 * 1000;
 
 const adminTokens = new Map();
+const studentTokens = new Map();
 
 function shuffleArray(items) {
   const copy = [...items];
@@ -48,6 +72,76 @@ function normalizeName(value) {
 
 function normalizeEmail(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function normalizeExamId(value) {
+  return normalizeName(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function normalizeProctoringPolicy(value = {}) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    tab_switch: source.tab_switch !== false,
+    window_blur: source.window_blur !== false,
+    fullscreen_exit: source.fullscreen_exit !== false,
+    right_click: source.right_click !== false,
+    restricted_key: source.restricted_key !== false,
+    deductTabSwitch: source.deductTabSwitch !== false,
+    deductWindowBlur: source.deductWindowBlur !== false,
+    deductFullscreenExit: source.deductFullscreenExit !== false,
+    deductRightClick: source.deductRightClick !== false,
+    deductRestrictedKey: source.deductRestrictedKey !== false,
+  };
+}
+
+function buildStudentKey(student, examId = '') {
+  const fullName = normalizeName(student?.fullName).toLowerCase();
+  const classRoom = normalizeName(student?.classRoom).toLowerCase();
+  const email = normalizeEmail(student?.email);
+  const safeExamId = normalizeExamId(examId || student?.examId || '');
+  return `${fullName}|${classRoom}|${email}|${safeExamId}`;
+}
+
+function normalizeStoredViolation(value) {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const type = normalizeName(value.type).slice(0, 80);
+  const detail = normalizeName(value.detail).slice(0, 160);
+  if (!type) {
+    return null;
+  }
+
+  const occurredAtInput = Number(value.occurredAt);
+  const occurredAt = Number.isFinite(occurredAtInput) && occurredAtInput > 0
+    ? occurredAtInput
+    : Date.now();
+
+  return {
+    id: normalizeName(value.id) || randomUUID(),
+    type,
+    detail,
+    occurredAt,
+    waived: Boolean(value.waived),
+    deduct: value.deduct !== false,
+    policy: normalizeName(value.policy) || 'default',
+    waivedAt:
+      Number.isFinite(Number(value.waivedAt)) && Number(value.waivedAt) > 0
+        ? Number(value.waivedAt)
+        : null,
+  };
+}
+
+function getActiveViolations(session) {
+  return (session.violations ?? []).filter((violation) => !violation.waived && violation.deduct !== false);
+}
+
+function getWaivedViolations(session) {
+  return (session.violations ?? []).filter((violation) => violation.waived);
 }
 
 function isValidEmail(value) {
@@ -131,67 +225,10 @@ function shuffleQuestionOptions(question) {
   };
 }
 
-function parseAdminPasscodeHash(hashValue) {
-  if (typeof hashValue !== 'string' || !hashValue) {
-    return null;
-  }
-
-  const parts = hashValue.split('$');
-  if (parts.length !== 6 || parts[0] !== 'scrypt') {
-    return null;
-  }
-
-  const n = Number(parts[1]);
-  const r = Number(parts[2]);
-  const p = Number(parts[3]);
-  const saltHex = parts[4];
-  const digestHex = parts[5];
-
-  if (!Number.isInteger(n) || n <= 1 || !Number.isInteger(r) || r <= 0 || !Number.isInteger(p) || p <= 0) {
-    return null;
-  }
-
-  if (!/^[a-fA-F0-9]+$/.test(saltHex) || saltHex.length % 2 !== 0) {
-    return null;
-  }
-
-  if (!/^[a-fA-F0-9]+$/.test(digestHex) || digestHex.length % 2 !== 0) {
-    return null;
-  }
-
-  const salt = Buffer.from(saltHex, 'hex');
-  const digest = Buffer.from(digestHex, 'hex');
-  if (salt.length < 16 || digest.length < 32) {
-    return null;
-  }
-
-  return {
-    n,
-    r,
-    p,
-    salt,
-    digest,
-  };
-}
-
-const parsedAdminPasscodeHash = parseAdminPasscodeHash(ADMIN_PASSCODE_HASH);
+const parsedAdminPasscodeHash = parseScryptHash(ADMIN_PASSCODE_HASH);
 
 function verifyAdminPasscode(passcode) {
-  if (!parsedAdminPasscodeHash || typeof passcode !== 'string' || passcode.length < 1) {
-    return false;
-  }
-
-  try {
-    const derived = scryptSync(passcode, parsedAdminPasscodeHash.salt, parsedAdminPasscodeHash.digest.length, {
-      N: parsedAdminPasscodeHash.n,
-      r: parsedAdminPasscodeHash.r,
-      p: parsedAdminPasscodeHash.p,
-    });
-
-    return timingSafeEqual(derived, parsedAdminPasscodeHash.digest);
-  } catch {
-    return false;
-  }
+  return Boolean(parsedAdminPasscodeHash) && verifyPasswordScrypt(passcode, ADMIN_PASSCODE_HASH);
 }
 
 function asPublicQuestion(question) {
@@ -250,10 +287,13 @@ function evaluateSession(session) {
 
   const totalQuestions = session.questionOrder.length;
   const rawPercent = totalQuestions === 0 ? 0 : Number(((correctCount / totalQuestions) * 100).toFixed(2));
+  const activeViolations = getActiveViolations(session);
+  const waivedViolations = getWaivedViolations(session);
   const penaltyPoints = Number(
-    Math.min(rawPercent, session.violations.length * PENALTY_PER_VIOLATION).toFixed(2)
+    Math.min(rawPercent, activeViolations.length * PENALTY_PER_VIOLATION).toFixed(2)
   );
   const finalPercent = Number(Math.max(0, rawPercent - penaltyPoints).toFixed(2));
+  const finalScoreOutOfExam = Number(((finalPercent / 100) * totalQuestions).toFixed(2));
   const finalScoreOutOf40 = Number(((finalPercent / 100) * EXAM_QUESTION_COUNT).toFixed(2));
 
   return {
@@ -262,8 +302,11 @@ function evaluateSession(session) {
     correctCount,
     rawPercent,
     penaltyPoints,
-    violationsCount: session.violations.length,
+    violationsCount: activeViolations.length,
+    totalViolationsCount: (session.violations ?? []).length,
+    waivedViolationsCount: waivedViolations.length,
     finalPercent,
+    finalScoreOutOfExam,
     finalScoreOutOf40,
     penaltyPerViolation: PENALTY_PER_VIOLATION,
   };
@@ -288,6 +331,62 @@ function finalizeSession(session) {
   };
 }
 
+function summariesEqual(left, right) {
+  if (!left || !right) {
+    return false;
+  }
+
+  const keys = [
+    'totalQuestions',
+    'answeredCount',
+    'correctCount',
+    'rawPercent',
+    'penaltyPoints',
+    'violationsCount',
+    'totalViolationsCount',
+    'waivedViolationsCount',
+    'finalPercent',
+    'finalScoreOutOfExam',
+    'finalScoreOutOf40',
+    'penaltyPerViolation',
+  ];
+
+  return keys.every((key) => left[key] === right[key]);
+}
+
+function violationsEqual(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) {
+    return false;
+  }
+
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (!a || !b) {
+      return false;
+    }
+
+    if (
+      a.id !== b.id ||
+      a.type !== b.type ||
+      a.detail !== b.detail ||
+      a.occurredAt !== b.occurredAt ||
+      (a.deduct !== false) !== (b.deduct !== false) ||
+      (a.policy ?? 'default') !== (b.policy ?? 'default') ||
+      Boolean(a.waived) !== Boolean(b.waived) ||
+      (a.waivedAt ?? null) !== (b.waivedAt ?? null)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function toClientSession(session) {
   const durationSeconds = session.durationSeconds ?? EXAM_DURATION_SECONDS;
   const remainingSeconds = session.submittedAt
@@ -301,7 +400,15 @@ function toClientSession(session) {
 
   return {
     sessionId: session.id,
+    exam: {
+      id: session.examId ?? 'general',
+      title: session.examTitle ?? 'General Exam Pool',
+      maxAttempts: session.examMaxAttempts ?? null,
+      proctoring: session.examProctoring ?? null,
+    },
+    trialNumber: session.trialNumber ?? 1,
     student: session.student,
+    studentKey: session.studentKey ?? buildStudentKey(session.student, session.examId),
     startedAt: session.startedAt,
     expiresAt: session.expiresAt,
     durationSeconds,
@@ -352,15 +459,45 @@ async function normalizeSession(session) {
     classRoom: normalizeName(session.student?.classRoom ?? ''),
     email: normalizeEmail(session.student?.email ?? ''),
   };
+  const normalizedExamId = normalizeExamId(session.examId) || 'general';
+  const matchingExam = await getExam(normalizedExamId);
+  const examTitle = normalizeName(session.examTitle) || matchingExam?.title || 'General Exam Pool';
+  const examMaxAttemptsInput = Number(session.examMaxAttempts);
+  const examMaxAttempts = Number.isFinite(examMaxAttemptsInput) && examMaxAttemptsInput > 0
+    ? Math.round(examMaxAttemptsInput)
+    : Number(matchingExam?.maxAttempts ?? 3);
+  const examProctoring = normalizeProctoringPolicy(session.examProctoring ?? matchingExam?.proctoring ?? {});
+  const trialNumberInput = Number(session.trialNumber);
+  const trialNumber = Number.isFinite(trialNumberInput) && trialNumberInput > 0
+    ? Math.round(trialNumberInput)
+    : 1;
+  const normalizedViolations = (Array.isArray(session.violations) ? session.violations : [])
+    .map((violation) => normalizeStoredViolation(violation))
+    .filter(Boolean);
+  const studentKey = normalizeName(session.studentKey) || buildStudentKey(normalizedStudent, normalizedExamId);
+  const userKey = normalizeName(session.userKey) || buildUserKey(normalizedStudent);
+  let userId = normalizeName(session.userId);
+  if (!userId && userKey) {
+    const linkedUser = await getUserByKey(userKey);
+    userId = linkedUser?.id ?? '';
+  }
 
   let next = {
     ...session,
     student: normalizedStudent,
+    examId: normalizedExamId,
+    examTitle,
+    examMaxAttempts,
+    examProctoring,
+    trialNumber,
+    studentKey,
+    userKey,
+    userId: userId || null,
     durationSeconds: session.durationSeconds ?? EXAM_DURATION_SECONDS,
     answers: session.answers ?? {},
     flagged: session.flagged ?? {},
     seen: session.seen ?? {},
-    violations: Array.isArray(session.violations) ? session.violations : [],
+    violations: normalizedViolations,
     questionOrder: Array.isArray(session.questionOrder) ? session.questionOrder : [],
     feedback: normalizeStoredFeedback(session.feedback),
   };
@@ -369,11 +506,19 @@ async function normalizeSession(session) {
     normalizedStudent.fullName !== (session.student?.fullName ?? '') ||
     normalizedStudent.classRoom !== (session.student?.classRoom ?? '') ||
     normalizedStudent.email !== (session.student?.email ?? '') ||
+    normalizedExamId !== (session.examId ?? '') ||
+    examTitle !== (session.examTitle ?? '') ||
+    examMaxAttempts !== session.examMaxAttempts ||
+    JSON.stringify(examProctoring) !== JSON.stringify(normalizeProctoringPolicy(session.examProctoring ?? {})) ||
+    trialNumber !== session.trialNumber ||
+    studentKey !== (session.studentKey ?? '') ||
+    userKey !== (session.userKey ?? '') ||
+    (userId || null) !== (session.userId ?? null) ||
     next.durationSeconds !== session.durationSeconds ||
     next.answers !== session.answers ||
     next.flagged !== session.flagged ||
     next.seen !== session.seen ||
-    next.violations !== session.violations ||
+    !violationsEqual(next.violations, Array.isArray(session.violations) ? session.violations : []) ||
     next.questionOrder !== session.questionOrder ||
     next.feedback !== session.feedback;
 
@@ -390,6 +535,17 @@ async function normalizeSession(session) {
   if (next.submittedAt && !next.summary) {
     next = finalizeSession(next);
     changed = true;
+  }
+
+  if (next.submittedAt && next.summary) {
+    const recalculated = evaluateSession(next);
+    if (!summariesEqual(next.summary, recalculated)) {
+      next = {
+        ...next,
+        summary: recalculated,
+      };
+      changed = true;
+    }
   }
 
   if (changed) {
@@ -413,11 +569,16 @@ async function getLatestSessions() {
   return Promise.all(sessions.map((session) => normalizeSession(session)));
 }
 
-async function getUpdatableSessionOrError(sessionId, res) {
+async function getUpdatableSessionOrError(sessionId, res, studentUser = null) {
   const session = await getLatestSession(sessionId);
 
   if (!session) {
     res.status(404).json({ error: 'Session not found.' });
+    return null;
+  }
+
+  if (studentUser && !studentOwnsSession(studentUser, session)) {
+    res.status(403).json({ error: 'You do not have access to this session.' });
     return null;
   }
 
@@ -446,6 +607,16 @@ function cleanupAdminTokens() {
   }
 }
 
+function cleanupStudentTokens() {
+  const now = Date.now();
+
+  for (const [token, details] of studentTokens.entries()) {
+    if (details.expiresAt <= now) {
+      studentTokens.delete(token);
+    }
+  }
+}
+
 function issueAdminToken() {
   cleanupAdminTokens();
 
@@ -455,6 +626,36 @@ function issueAdminToken() {
 
   adminTokens.set(token, { token, createdAt, expiresAt });
   return { token, createdAt, expiresAt };
+}
+
+function issueStudentToken(user) {
+  cleanupStudentTokens();
+
+  const token = randomUUID();
+  const createdAt = Date.now();
+  const expiresAt = createdAt + STUDENT_TOKEN_LIFETIME_MS;
+
+  studentTokens.set(token, {
+    token,
+    createdAt,
+    expiresAt,
+    userId: user.id,
+    userKey: user.userKey,
+  });
+
+  return { token, createdAt, expiresAt };
+}
+
+function revokeStudentTokensForUser(userId) {
+  if (!userId) {
+    return;
+  }
+
+  for (const [token, details] of studentTokens.entries()) {
+    if (details.userId === userId) {
+      studentTokens.delete(token);
+    }
+  }
 }
 
 function getBearerToken(req) {
@@ -482,6 +683,40 @@ function requireAdmin(req, res, next) {
   }
 
   req.admin = details;
+  next();
+}
+
+async function requireStudent(req, res, next) {
+  cleanupStudentTokens();
+
+  const token = getBearerToken(req);
+  if (!token) {
+    res.status(401).json({ error: 'Missing student token.' });
+    return;
+  }
+
+  const tokenDetails = studentTokens.get(token);
+  if (!tokenDetails) {
+    res.status(401).json({ error: 'Invalid or expired student token.' });
+    return;
+  }
+
+  const user = await getUserById(tokenDetails.userId);
+  if (!user) {
+    studentTokens.delete(token);
+    res.status(401).json({ error: 'Student account not found.' });
+    return;
+  }
+
+  if (user.disabled) {
+    res.status(403).json({ error: 'This student account is disabled. Contact admin.' });
+    return;
+  }
+
+  req.student = {
+    token: tokenDetails,
+    user,
+  };
   next();
 }
 
@@ -516,9 +751,17 @@ function toSessionRow(session) {
   const remainingSeconds = session.submittedAt
     ? 0
     : Math.max(0, Math.ceil((session.expiresAt - Date.now()) / 1000));
+  const activeViolationsCount = session.summary?.violationsCount ?? getActiveViolations(session).length;
+  const totalViolationsCount = session.summary?.totalViolationsCount ?? (session.violations?.length ?? 0);
+  const waivedViolationsCount =
+    session.summary?.waivedViolationsCount ?? Math.max(0, totalViolationsCount - activeViolationsCount);
 
   return {
     id: session.id,
+    examId: session.examId ?? 'general',
+    examTitle: session.examTitle ?? 'General Exam Pool',
+    trialNumber: session.trialNumber ?? 1,
+    studentKey: session.studentKey ?? buildStudentKey(session.student, session.examId),
     studentName: session.student?.fullName ?? 'Unknown',
     classRoom: session.student?.classRoom ?? 'Unknown',
     email: session.student?.email ?? '',
@@ -527,7 +770,9 @@ function toSessionRow(session) {
     expiresAt: session.expiresAt,
     status,
     remainingSeconds,
-    violationsCount: session.violations?.length ?? 0,
+    violationsCount: activeViolationsCount,
+    totalViolationsCount,
+    waivedViolationsCount,
     answeredCount: session.summary?.answeredCount ?? 0,
     correctCount: session.summary?.correctCount ?? 0,
     rawPercent: session.summary?.rawPercent ?? 0,
@@ -535,6 +780,26 @@ function toSessionRow(session) {
     feedbackRating: session.feedback?.rating ?? null,
     feedbackComment: session.feedback?.comment ?? '',
     feedbackSubmittedAt: session.feedback?.submittedAt ?? null,
+  };
+}
+
+function toStudentTrialRow(session) {
+  return {
+    id: session.id,
+    exam: {
+      id: session.examId ?? 'general',
+      title: session.examTitle ?? 'General Exam Pool',
+      maxAttempts: session.examMaxAttempts ?? null,
+    },
+    trialNumber: session.trialNumber ?? 1,
+    status: sessionStatus(session),
+    startedAt: session.startedAt,
+    submittedAt: session.submittedAt,
+    expiresAt: session.expiresAt,
+    durationSeconds: session.durationSeconds ?? EXAM_DURATION_SECONDS,
+    summary: session.summary ?? evaluateSession(session),
+    violations: session.violations ?? [],
+    feedback: session.feedback ?? null,
   };
 }
 
@@ -637,6 +902,92 @@ function buildOverview(sessions, questionPool) {
     ratingDistributionMap[rating] += 1;
   }
 
+  const studentBuckets = new Map();
+  for (const session of sessions) {
+    const studentKey = session.studentKey ?? buildStudentKey(session.student, session.examId);
+    const existing = studentBuckets.get(studentKey) ?? {
+      studentKey,
+      studentName: session.student?.fullName ?? 'Unknown',
+      classRoom: session.student?.classRoom ?? 'Unknown',
+      email: session.student?.email ?? '',
+      totalTrials: 0,
+      submittedTrials: 0,
+      bestFinalPercent: -1,
+      bestSessionId: null,
+      bestTrialNumber: null,
+      bestExamId: null,
+      bestExamTitle: null,
+      latestStartedAt: 0,
+      scores: [],
+    };
+
+    existing.totalTrials += 1;
+    existing.latestStartedAt = Math.max(existing.latestStartedAt, Number(session.startedAt) || 0);
+
+    if (session.submittedAt) {
+      existing.submittedTrials += 1;
+      const finalPercent = Number(session.summary?.finalPercent ?? 0);
+      existing.scores.push(finalPercent);
+      if (finalPercent > existing.bestFinalPercent) {
+        existing.bestFinalPercent = finalPercent;
+        existing.bestSessionId = session.id;
+        existing.bestTrialNumber = session.trialNumber ?? 1;
+        existing.bestExamId = session.examId ?? 'general';
+        existing.bestExamTitle = session.examTitle ?? 'General Exam Pool';
+      }
+    }
+
+    studentBuckets.set(studentKey, existing);
+  }
+
+  const studentSummaries = [...studentBuckets.values()].map((item) => ({
+    studentKey: item.studentKey,
+    studentName: item.studentName,
+    classRoom: item.classRoom,
+    email: item.email,
+    totalTrials: item.totalTrials,
+    submittedTrials: item.submittedTrials,
+    averageFinalPercent: average(item.scores),
+    bestFinalPercent: item.bestFinalPercent < 0 ? 0 : Number(item.bestFinalPercent.toFixed(2)),
+    bestSessionId: item.bestSessionId,
+    bestTrialNumber: item.bestTrialNumber,
+    bestExamId: item.bestExamId,
+    bestExamTitle: item.bestExamTitle,
+    latestStartedAt: item.latestStartedAt,
+  }));
+
+  const outstandingStudents = studentSummaries
+    .filter((student) => student.submittedTrials > 0)
+    .sort((left, right) => {
+      if (right.bestFinalPercent !== left.bestFinalPercent) {
+        return right.bestFinalPercent - left.bestFinalPercent;
+      }
+      if (right.averageFinalPercent !== left.averageFinalPercent) {
+        return right.averageFinalPercent - left.averageFinalPercent;
+      }
+      return right.submittedTrials - left.submittedTrials;
+    })
+    .slice(0, 10);
+
+  const classLeaderboards = [...new Set(studentSummaries.map((student) => student.classRoom))]
+    .map((classRoom) => ({
+      classRoom,
+      leaders: studentSummaries
+        .filter((student) => student.classRoom === classRoom && student.submittedTrials > 0)
+        .sort((left, right) => {
+          if (right.bestFinalPercent !== left.bestFinalPercent) {
+            return right.bestFinalPercent - left.bestFinalPercent;
+          }
+          if (right.averageFinalPercent !== left.averageFinalPercent) {
+            return right.averageFinalPercent - left.averageFinalPercent;
+          }
+          return right.submittedTrials - left.submittedTrials;
+        })
+        .slice(0, 5),
+    }))
+    .filter((item) => item.leaders.length > 0)
+    .sort((left, right) => left.classRoom.localeCompare(right.classRoom));
+
   return {
     totals: {
       candidates: sessions.length,
@@ -651,6 +1002,9 @@ function buildOverview(sessions, questionPool) {
       lowScoreCount: submitted.filter((session) => (session.summary?.finalPercent ?? 0) < 40).length,
       feedbackCount: feedbackSessions.length,
       averageRating: average(ratingValues),
+      uniqueStudents: studentSummaries.length,
+      repeatCandidates: studentSummaries.filter((student) => student.totalTrials > 1).length,
+      averageTrialsPerStudent: average(studentSummaries.map((student) => student.totalTrials)),
     },
     scoreDistribution: Object.entries(scoreDistributionMap).map(([band, count]) => ({ band, count })),
     classPerformance,
@@ -667,6 +1021,11 @@ function buildOverview(sessions, questionPool) {
       rating: Number(rating),
       count,
     })),
+    outstandingStudents,
+    classLeaderboards,
+    studentSummaries: studentSummaries
+      .sort((left, right) => right.latestStartedAt - left.latestStartedAt)
+      .slice(0, 200),
     recentSubmissions: submitted
       .sort((left, right) => (right.submittedAt ?? 0) - (left.submittedAt ?? 0))
       .slice(0, 10)
@@ -697,6 +1056,169 @@ function questionToAdminRow(question) {
   return {
     ...question,
     answerKey: question.correctOptionIds.join(', '),
+  };
+}
+
+function examAllowsClass(exam, classRoom) {
+  if (!exam || !Array.isArray(exam.allowedClasses)) {
+    return false;
+  }
+
+  return exam.allowedClasses.includes(classRoom);
+}
+
+function pickExamQuestionSet(exam, questionPool, questionMap) {
+  if (!exam) {
+    return [];
+  }
+
+  if (exam.mode === 'fixed') {
+    return (exam.questionIds ?? [])
+      .map((questionId) => questionMap.get(questionId))
+      .filter(Boolean);
+  }
+
+  if (exam.id === 'general') {
+    return questionPool.filter((question) => (question.sourceExamId ?? 'general') === 'general');
+  }
+
+  return questionPool.filter((question) => (question.sourceExamId ?? 'general') === exam.id);
+}
+
+function buildQuestionReview(session) {
+  return (session.questionOrder ?? [])
+    .map((questionId, index) => {
+      const question = session.questionSnapshot?.[questionId];
+      if (!question) {
+        return null;
+      }
+
+      const selectedOptionIds = session.answers?.[questionId] ?? [];
+      const isCorrect = hasSameOptions(selectedOptionIds, question.correctOptionIds ?? []);
+
+      return {
+        index: index + 1,
+        questionId,
+        topic: question.topic,
+        type: question.type,
+        text: question.text,
+        options: question.options ?? [],
+        selectedOptionIds,
+        correctOptionIds: question.correctOptionIds ?? [],
+        isCorrect,
+      };
+    })
+    .filter(Boolean);
+}
+
+function sanitizeViolationIds(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return [...new Set(value.map((id) => normalizeName(id)).filter(Boolean))];
+}
+
+function getViolationPolicy(session, type) {
+  const policy = normalizeProctoringPolicy(session?.examProctoring ?? {});
+
+  const mapping = {
+    tab_switch: {
+      track: policy.tab_switch,
+      deduct: policy.deductTabSwitch,
+      policy: 'tab_switch',
+    },
+    window_blur: {
+      track: policy.window_blur,
+      deduct: policy.deductWindowBlur,
+      policy: 'window_blur',
+    },
+    fullscreen_exit: {
+      track: policy.fullscreen_exit,
+      deduct: policy.deductFullscreenExit,
+      policy: 'fullscreen_exit',
+    },
+    right_click: {
+      track: policy.right_click,
+      deduct: policy.deductRightClick,
+      policy: 'right_click',
+    },
+    restricted_key: {
+      track: policy.restricted_key,
+      deduct: policy.deductRestrictedKey,
+      policy: 'restricted_key',
+    },
+  };
+
+  const normalizedType = normalizeName(type).toLowerCase();
+  const selected = mapping[normalizedType];
+  if (!selected) {
+    return {
+      track: true,
+      deduct: true,
+      policy: 'default',
+    };
+  }
+
+  return {
+    track: selected.track !== false,
+    deduct: selected.track !== false && selected.deduct !== false,
+    policy: selected.track === false ? `${selected.policy}:monitor_only` : selected.policy,
+  };
+}
+
+function studentOwnsSession(studentUser, session) {
+  if (!studentUser || !session) {
+    return false;
+  }
+
+  return (
+    (session.userId && session.userId === studentUser.id) ||
+    (session.userKey && session.userKey === studentUser.userKey)
+  );
+}
+
+function buildExamAttemptStatsForUser(user, exams, sessions) {
+  return exams.map((exam) => {
+    const trials = sessions.filter(
+      (session) => session.userKey === user.userKey && (session.examId ?? 'general') === exam.id
+    );
+    const submitted = trials.filter((session) => session.submittedAt);
+    const bestFinalPercent = submitted.length
+      ? Math.max(...submitted.map((session) => Number(session.summary?.finalPercent ?? 0)))
+      : 0;
+    const maxAttempts = Number(exam.maxAttempts ?? 3);
+    const attemptsUsed = trials.length;
+    const attemptsRemaining = Math.max(0, maxAttempts - attemptsUsed);
+    const canAttempt = attemptsRemaining > 0;
+
+    return {
+      ...toPublicExam(exam),
+      attemptsUsed,
+      attemptsRemaining,
+      maxAttempts,
+      canAttempt,
+      bestFinalPercent: Number(bestFinalPercent.toFixed(2)),
+    };
+  });
+}
+
+function buildStudentDashboardPayload(user, exams, sessions) {
+  const availableExams = exams.filter(
+    (exam) => exam.published && examAllowsClass(exam, user.classRoom)
+  );
+  const examStats = buildExamAttemptStatsForUser(user, availableExams, sessions);
+  const trials = sessions
+    .filter((session) => studentOwnsSession(user, session))
+    .sort((left, right) => right.startedAt - left.startedAt);
+  const activeSession =
+    trials.find((session) => !session.submittedAt && sessionStatus(session) === 'active') ?? null;
+
+  return {
+    user: toPublicUserRecord(user),
+    exams: examStats,
+    activeSession: activeSession ? toClientSession(activeSession) : null,
+    trials: trials.slice(0, 40).map(toStudentTrialRow),
   };
 }
 
@@ -770,25 +1292,28 @@ app.get('/api/keep-alive', (_req, res) => {
 });
 
 app.get('/api/exam/meta', async (_req, res) => {
-  const questionPool = await getQuestionPool();
+  const [questionPool, exams] = await Promise.all([getQuestionPool(), listExams()]);
+  const generalExam = exams.find((exam) => exam.id === 'general');
 
   res.json({
     schoolName: 'Salem Academy',
-    durationSeconds: EXAM_DURATION_SECONDS,
-    questionCount: EXAM_QUESTION_COUNT,
+    durationSeconds: generalExam?.durationSeconds ?? EXAM_DURATION_SECONDS,
+    questionCount: generalExam?.questionCount ?? EXAM_QUESTION_COUNT,
     questionPoolCount: questionPool.length,
     classOptions: CLASS_OPTIONS,
     penaltyPerViolation: PENALTY_PER_VIOLATION,
+    exams: exams.filter((exam) => exam.published).map((exam) => toPublicExam(exam)),
   });
 });
 
-app.post('/api/exam/start', async (req, res) => {
+app.post('/api/student/login', async (req, res) => {
   const fullName = normalizeName(req.body?.fullName);
   const classRoom = normalizeName(req.body?.classRoom);
   const email = normalizeEmail(req.body?.email);
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
 
   if (fullName.length < 5) {
-    res.status(400).json({ error: 'Please enter the full name (at least 5 characters).' });
+    res.status(400).json({ error: 'Please enter your full name (at least 5 characters).' });
     return;
   }
 
@@ -802,28 +1327,273 @@ app.post('/api/exam/start', async (req, res) => {
     return;
   }
 
-  const questionPool = await getQuestionPool();
-  if (questionPool.length < EXAM_QUESTION_COUNT) {
+  if (password.length < 3) {
+    res.status(400).json({ error: 'Please enter your password.' });
+    return;
+  }
+
+  const userKey = buildUserKey({ fullName, classRoom, email });
+  let user = await getUserByKey(userKey);
+  if (!user) {
+    try {
+      user = await createUserFromDefaultPassword({ fullName, classRoom, email });
+    } catch {
+      user = await getUserByKey(userKey);
+    }
+  }
+
+  if (!user) {
+    res.status(500).json({ error: 'Could not create your student account right now.' });
+    return;
+  }
+
+  if (user.disabled) {
+    res.status(403).json({ error: 'This account is disabled. Contact admin for help.' });
+    return;
+  }
+
+  if (!verifyPasswordScrypt(password, user.passwordHash)) {
+    res.status(401).json({ error: 'Invalid password.' });
+    return;
+  }
+
+  await touchUserLogin(user.id);
+  const refreshedUser = (await getUserById(user.id)) ?? user;
+  const tokenInfo = issueStudentToken(refreshedUser);
+  const [exams, sessions] = await Promise.all([listExams(), getLatestSessions()]);
+  const dashboard = buildStudentDashboardPayload(refreshedUser, exams, sessions);
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    token: tokenInfo.token,
+    expiresAt: tokenInfo.expiresAt,
+    tokenLifetimeMs: STUDENT_TOKEN_LIFETIME_MS,
+    ...dashboard,
+  });
+});
+
+app.get('/api/student/me', requireStudent, async (req, res) => {
+  const [exams, sessions] = await Promise.all([listExams(), getLatestSessions()]);
+  const dashboard = buildStudentDashboardPayload(req.student.user, exams, sessions);
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    ...dashboard,
+  });
+});
+
+app.post('/api/student/change-password', requireStudent, async (req, res) => {
+  const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+  const nextPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+
+  if (!currentPassword || !nextPassword) {
+    res.status(400).json({ error: 'Current password and new password are required.' });
+    return;
+  }
+
+  if (nextPassword.length < 4) {
+    res.status(400).json({ error: 'New password must be at least 4 characters.' });
+    return;
+  }
+
+  if (!verifyPasswordScrypt(currentPassword, req.student.user.passwordHash)) {
+    res.status(401).json({ error: 'Current password is incorrect.' });
+    return;
+  }
+
+  if (currentPassword === nextPassword) {
+    res.status(400).json({ error: 'New password must be different from current password.' });
+    return;
+  }
+
+  const nextHash = hashPasswordScrypt(nextPassword);
+  const updated = await updateUserPassword(req.student.user.id, nextHash, {
+    mustChangePassword: false,
+  });
+  if (!updated) {
+    res.status(404).json({ error: 'Student account not found.' });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    user: toPublicUserRecord(updated),
+  });
+});
+
+app.post('/api/student/password-help', async (req, res) => {
+  const fullName = normalizeName(req.body?.fullName);
+  const classRoom = normalizeName(req.body?.classRoom);
+  const email = normalizeEmail(req.body?.email);
+  const message = normalizeName(req.body?.message ?? '');
+
+  if (fullName.length < 5) {
+    res.status(400).json({ error: 'Please enter your full name.' });
+    return;
+  }
+
+  if (!CLASS_OPTIONS.includes(classRoom)) {
+    res.status(400).json({ error: 'Please choose a valid class.' });
+    return;
+  }
+
+  if (!isValidEmail(email)) {
+    res.status(400).json({ error: 'Please enter a valid email address.' });
+    return;
+  }
+
+  const requestRow = await createPasswordAssistanceRequest({
+    fullName,
+    classRoom,
+    email,
+    message,
+  });
+
+  res.status(201).json({
+    ok: true,
+    request: requestRow,
+    message: 'Password help request sent. Admin will assist you shortly.',
+  });
+});
+
+app.get('/api/student/trials', requireStudent, async (req, res) => {
+  const sessions = await getLatestSessions();
+  const trials = sessions
+    .filter((session) => studentOwnsSession(req.student.user, session))
+    .sort((left, right) => right.startedAt - left.startedAt)
+    .map(toStudentTrialRow);
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    total: trials.length,
+    trials,
+  });
+});
+
+app.get('/api/student/trials/:sessionId', requireStudent, async (req, res) => {
+  const trial = await getLatestSession(req.params.sessionId);
+  if (!trial) {
+    res.status(404).json({ error: 'Trial not found.' });
+    return;
+  }
+
+  if (!studentOwnsSession(req.student.user, trial)) {
+    res.status(403).json({ error: 'You do not have access to this trial.' });
+    return;
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    trial: {
+      ...toStudentTrialRow(trial),
+      questionReview: buildQuestionReview(trial),
+      exam: {
+        id: trial.examId ?? 'general',
+        title: trial.examTitle ?? 'General Exam Pool',
+      },
+    },
+  });
+});
+
+app.post('/api/exam/start', requireStudent, async (req, res) => {
+  const requestedExamId = normalizeExamId(req.body?.examId) || 'general';
+  const user = req.student.user;
+  const fullName = user.fullName;
+  const classRoom = user.classRoom;
+  const email = user.email;
+
+  const [selectedExam, questionPool, questionMap, sessions] = await Promise.all([
+    getExam(requestedExamId),
+    getQuestionPool(),
+    getQuestionByIdMap(),
+    getLatestSessions(),
+  ]);
+
+  if (!selectedExam || !selectedExam.published) {
+    res.status(404).json({ error: 'Selected exam is not available.' });
+    return;
+  }
+
+  if (!examAllowsClass(selectedExam, classRoom)) {
+    res.status(403).json({ error: `This exam is not available for class ${classRoom}.` });
+    return;
+  }
+
+  const examQuestionPool = pickExamQuestionSet(selectedExam, questionPool, questionMap);
+  const requiredQuestionCount = selectedExam.questionCount ?? EXAM_QUESTION_COUNT;
+
+  if (examQuestionPool.length < requiredQuestionCount) {
     res.status(503).json({
-      error: `Question pool has ${questionPool.length}. At least ${EXAM_QUESTION_COUNT} questions are required.`,
+      error: `Exam question pool has ${examQuestionPool.length}. At least ${requiredQuestionCount} questions are required.`,
     });
     return;
   }
 
-  const servedQuestions = shuffleArray(questionPool)
-    .slice(0, EXAM_QUESTION_COUNT)
+  const existingTrials = sessions.filter(
+    (session) => studentOwnsSession(user, session) && (session.examId ?? 'general') === selectedExam.id
+  );
+  const activeTrial = existingTrials.find(
+    (session) => !session.submittedAt && sessionStatus(session) === 'active'
+  );
+  const maxAttempts = Number(selectedExam.maxAttempts ?? 3);
+  const attemptsUsed = existingTrials.length;
+  const attemptsRemaining = Math.max(0, maxAttempts - attemptsUsed);
+  if (activeTrial) {
+    res.status(409).json({
+      error: 'You already have an active trial for this exam.',
+      attemptsUsed,
+      maxAttempts,
+      attemptsRemaining,
+      session: toClientSession(activeTrial),
+    });
+    return;
+  }
+
+  if (attemptsRemaining <= 0) {
+    res.status(409).json({
+      error: `Attempt limit reached for ${selectedExam.title}.`,
+      attemptsUsed,
+      maxAttempts,
+      attemptsRemaining,
+    });
+    return;
+  }
+
+  const servedQuestions = shuffleArray(examQuestionPool)
+    .slice(0, requiredQuestionCount)
     .map(shuffleQuestionOptions);
   const startedAt = Date.now();
+  const studentKey = buildStudentKey(
+    {
+      fullName,
+      classRoom,
+      email,
+    },
+    selectedExam.id
+  );
+  const trialNumber = existingTrials.length + 1;
   const session = {
     id: randomUUID(),
+    examId: selectedExam.id,
+    examTitle: selectedExam.title,
+    examMaxAttempts: maxAttempts,
+    examProctoring: normalizeProctoringPolicy(selectedExam.proctoring ?? {}),
+    studentKey,
+    userId: user.id,
+    userKey: user.userKey,
+    trialNumber,
     student: {
       fullName,
       classRoom,
       email,
     },
     startedAt,
-    expiresAt: startedAt + EXAM_DURATION_SECONDS * 1000,
-    durationSeconds: EXAM_DURATION_SECONDS,
+    expiresAt: startedAt + selectedExam.durationSeconds * 1000,
+    durationSeconds: selectedExam.durationSeconds,
     questionOrder: servedQuestions.map((question) => question.id),
     questionSnapshot: Object.fromEntries(servedQuestions.map((question) => [question.id, question])),
     answers: {},
@@ -836,10 +1606,15 @@ app.post('/api/exam/start', async (req, res) => {
   };
 
   await saveSession(session);
-  res.status(201).json(toClientSession(session));
+  res.status(201).json({
+    ...toClientSession(session),
+    attemptsUsed: trialNumber,
+    maxAttempts,
+    attemptsRemaining: Math.max(0, maxAttempts - trialNumber),
+  });
 });
 
-app.get('/api/exam/:sessionId', async (req, res) => {
+app.get('/api/exam/:sessionId', requireStudent, async (req, res) => {
   const session = await getLatestSession(req.params.sessionId);
 
   if (!session) {
@@ -847,14 +1622,19 @@ app.get('/api/exam/:sessionId', async (req, res) => {
     return;
   }
 
+  if (!studentOwnsSession(req.student.user, session)) {
+    res.status(403).json({ error: 'You do not have access to this session.' });
+    return;
+  }
+
   res.json(toClientSession(session));
 });
 
-app.post('/api/exam/:sessionId/seen', async (req, res) => {
+app.post('/api/exam/:sessionId/seen', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
   const questionId = req.body?.questionId;
 
-  const session = await getUpdatableSessionOrError(sessionId, res);
+  const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
   if (!session) {
     return;
   }
@@ -875,11 +1655,11 @@ app.post('/api/exam/:sessionId/seen', async (req, res) => {
   res.json({ ok: true, seen: updated?.seen ?? session.seen });
 });
 
-app.post('/api/exam/:sessionId/answer', async (req, res) => {
+app.post('/api/exam/:sessionId/answer', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
   const questionId = req.body?.questionId;
 
-  const session = await getUpdatableSessionOrError(sessionId, res);
+  const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
   if (!session) {
     return;
   }
@@ -908,12 +1688,12 @@ app.post('/api/exam/:sessionId/answer', async (req, res) => {
   res.json({ ok: true, responses: updated?.answers ?? session.answers });
 });
 
-app.post('/api/exam/:sessionId/flag', async (req, res) => {
+app.post('/api/exam/:sessionId/flag', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
   const questionId = req.body?.questionId;
   const flagged = Boolean(req.body?.flagged);
 
-  const session = await getUpdatableSessionOrError(sessionId, res);
+  const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
   if (!session) {
     return;
   }
@@ -934,10 +1714,10 @@ app.post('/api/exam/:sessionId/flag', async (req, res) => {
   res.json({ ok: true, flagged: updated?.flagged ?? session.flagged });
 });
 
-app.post('/api/exam/:sessionId/proctor', async (req, res) => {
+app.post('/api/exam/:sessionId/proctor', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
 
-  const session = await getUpdatableSessionOrError(sessionId, res);
+  const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
   if (!session) {
     return;
   }
@@ -950,11 +1730,16 @@ app.post('/api/exam/:sessionId/proctor', async (req, res) => {
     return;
   }
 
+  const violationPolicy = getViolationPolicy(session, type);
   const violation = {
     id: randomUUID(),
     type: type.slice(0, 80),
     detail: detail.slice(0, 160),
     occurredAt: Date.now(),
+    waived: false,
+    deduct: violationPolicy.deduct,
+    policy: violationPolicy.policy,
+    waivedAt: null,
   };
 
   const updated = await updateSession(sessionId, (current) => ({
@@ -969,12 +1754,17 @@ app.post('/api/exam/:sessionId/proctor', async (req, res) => {
   });
 });
 
-app.post('/api/exam/:sessionId/submit', async (req, res) => {
+app.post('/api/exam/:sessionId/submit', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
   const latest = await getLatestSession(sessionId);
 
   if (!latest) {
     res.status(404).json({ error: 'Session not found.' });
+    return;
+  }
+
+  if (!studentOwnsSession(req.student.user, latest)) {
+    res.status(403).json({ error: 'You do not have access to this session.' });
     return;
   }
 
@@ -988,12 +1778,17 @@ app.post('/api/exam/:sessionId/submit', async (req, res) => {
   });
 });
 
-app.post('/api/exam/:sessionId/feedback', async (req, res) => {
+app.post('/api/exam/:sessionId/feedback', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
   const latest = await getLatestSession(sessionId);
 
   if (!latest) {
     res.status(404).json({ error: 'Session not found.' });
+    return;
+  }
+
+  if (!studentOwnsSession(req.student.user, latest)) {
+    res.status(403).json({ error: 'You do not have access to this session.' });
     return;
   }
 
@@ -1061,6 +1856,7 @@ app.get('/api/admin/sessions', requireAdmin, async (req, res) => {
   const search = normalizeName(req.query?.search ?? '').toLowerCase();
   const classRoom = normalizeName(req.query?.classRoom ?? '');
   const statusFilter = normalizeName(req.query?.status ?? '').toLowerCase();
+  const examIdFilter = normalizeExamId(req.query?.examId ?? '');
 
   const sessions = await getLatestSessions();
 
@@ -1075,8 +1871,13 @@ app.get('/api/admin/sessions', requireAdmin, async (req, res) => {
       return false;
     }
 
+    if (examIdFilter && sessionRow.examId !== examIdFilter) {
+      return false;
+    }
+
     if (search) {
-      const haystack = `${sessionRow.studentName} ${sessionRow.email} ${sessionRow.id}`.toLowerCase();
+      const haystack =
+        `${sessionRow.studentName} ${sessionRow.email} ${sessionRow.id} ${sessionRow.examTitle}`.toLowerCase();
       if (!haystack.includes(search)) {
         return false;
       }
@@ -1113,8 +1914,93 @@ app.get('/api/admin/sessions/:sessionId', requireAdmin, async (req, res) => {
       internal: {
         id: session.id,
         status: sessionStatus(session),
+        row: toSessionRow(session),
+        violations: session.violations ?? [],
+        questionReview: buildQuestionReview(session),
       },
     },
+  });
+});
+
+app.patch('/api/admin/sessions/:sessionId/violations/waive', requireAdmin, async (req, res) => {
+  const sessionId = req.params.sessionId;
+  const latest = await getLatestSession(sessionId);
+
+  if (!latest) {
+    res.status(404).json({ error: 'Session not found.' });
+    return;
+  }
+
+  const waiveAll = Boolean(req.body?.waiveAll);
+  const violationIds = sanitizeViolationIds(req.body?.violationIds);
+  const waived = req.body?.waived === false ? false : true;
+
+  if (!waiveAll && !violationIds.length) {
+    res.status(400).json({ error: 'Provide violationIds or use waiveAll=true.' });
+    return;
+  }
+
+  const violationIdSet = new Set(violationIds);
+  const actionTimestamp = Date.now();
+
+  const updated = await updateSession(sessionId, (current) => {
+    const currentViolations = Array.isArray(current.violations) ? current.violations : [];
+    let changed = false;
+
+    const nextViolations = currentViolations.map((violation) => {
+      const shouldUpdate = waiveAll || violationIdSet.has(violation.id);
+      if (!shouldUpdate) {
+        return {
+          ...violation,
+          waived: Boolean(violation.waived),
+          waivedAt: violation.waived ? violation.waivedAt ?? null : null,
+        };
+      }
+
+      if (Boolean(violation.waived) === waived) {
+        return {
+          ...violation,
+          waived: Boolean(violation.waived),
+          waivedAt: violation.waived ? violation.waivedAt ?? null : null,
+        };
+      }
+
+      changed = true;
+      return {
+        ...violation,
+        waived,
+        waivedAt: waived ? actionTimestamp : null,
+      };
+    });
+
+    if (!changed) {
+      return current;
+    }
+
+    const nextSession = {
+      ...current,
+      violations: nextViolations,
+    };
+
+    if (nextSession.submittedAt) {
+      nextSession.summary = evaluateSession(nextSession);
+    }
+
+    return nextSession;
+  });
+
+  if (!updated) {
+    res.status(404).json({ error: 'Session not found.' });
+    return;
+  }
+
+  const normalized = await getLatestSession(sessionId);
+  res.json({
+    ok: true,
+    waived,
+    session: toSessionRow(normalized),
+    summary: normalized.summary,
+    violations: normalized.violations ?? [],
   });
 });
 
@@ -1170,15 +2056,552 @@ app.post('/api/admin/sessions/purge', requireAdmin, async (req, res) => {
   });
 });
 
-app.get('/api/admin/questions', requireAdmin, async (_req, res) => {
-  const questionPool = await getQuestionPool();
+app.get('/api/admin/students', requireAdmin, async (req, res) => {
+  const search = normalizeName(req.query?.search ?? '').toLowerCase();
+  const classRoom = normalizeName(req.query?.classRoom ?? '');
+  const examIdFilter = normalizeExamId(req.query?.examId ?? '');
+
+  const sessions = await getLatestSessions();
+  const grouped = new Map();
+
+  for (const session of sessions) {
+    const row = toSessionRow(session);
+    const key = row.studentKey;
+    const existing = grouped.get(key) ?? {
+      studentKey: key,
+      studentName: row.studentName,
+      classRoom: row.classRoom,
+      email: row.email,
+      examId: row.examId,
+      examTitle: row.examTitle,
+      totalTrials: 0,
+      submittedTrials: 0,
+      activeTrials: 0,
+      timeUpTrials: 0,
+      bestFinalPercent: 0,
+      averageFinalPercent: 0,
+      latestStartedAt: 0,
+      scores: [],
+      trials: [],
+    };
+
+    existing.totalTrials += 1;
+    existing.latestStartedAt = Math.max(existing.latestStartedAt, row.startedAt);
+
+    if (row.status === 'submitted') {
+      existing.submittedTrials += 1;
+      existing.scores.push(row.finalPercent);
+      existing.bestFinalPercent = Math.max(existing.bestFinalPercent, row.finalPercent);
+    } else if (row.status === 'active') {
+      existing.activeTrials += 1;
+    } else {
+      existing.timeUpTrials += 1;
+    }
+
+    existing.trials.push({
+      id: row.id,
+      trialNumber: row.trialNumber,
+      status: row.status,
+      finalPercent: row.finalPercent,
+      violationsCount: row.violationsCount,
+      totalViolationsCount: row.totalViolationsCount,
+      waivedViolationsCount: row.waivedViolationsCount,
+      startedAt: row.startedAt,
+      submittedAt: row.submittedAt,
+    });
+
+    grouped.set(key, existing);
+  }
+
+  const students = [...grouped.values()]
+    .map((entry) => ({
+      studentKey: entry.studentKey,
+      studentName: entry.studentName,
+      classRoom: entry.classRoom,
+      email: entry.email,
+      examId: entry.examId,
+      examTitle: entry.examTitle,
+      totalTrials: entry.totalTrials,
+      submittedTrials: entry.submittedTrials,
+      activeTrials: entry.activeTrials,
+      timeUpTrials: entry.timeUpTrials,
+      bestFinalPercent: Number(entry.bestFinalPercent.toFixed(2)),
+      averageFinalPercent: average(entry.scores),
+      latestStartedAt: entry.latestStartedAt,
+      trials: entry.trials.sort((left, right) => right.startedAt - left.startedAt),
+    }))
+    .filter((entry) => {
+      if (classRoom && entry.classRoom !== classRoom) {
+        return false;
+      }
+
+      if (examIdFilter && entry.examId !== examIdFilter) {
+        return false;
+      }
+
+      if (!search) {
+        return true;
+      }
+
+      const haystack = `${entry.studentName} ${entry.email} ${entry.examTitle} ${entry.studentKey}`.toLowerCase();
+      return haystack.includes(search);
+    })
+    .sort((left, right) => right.latestStartedAt - left.latestStartedAt);
 
   res.setHeader('Cache-Control', 'no-store');
   res.json({
     ok: true,
-    questionCount: questionPool.length,
+    total: students.length,
+    students,
+  });
+});
+
+app.get('/api/admin/students/:studentKey/trials', requireAdmin, async (req, res) => {
+  const studentKey = normalizeName(req.params.studentKey);
+  if (!studentKey) {
+    res.status(400).json({ error: 'Student key is required.' });
+    return;
+  }
+
+  const sessions = await getLatestSessions();
+  const trials = sessions
+    .filter((session) => (session.studentKey ?? '') === studentKey)
+    .sort((left, right) => right.startedAt - left.startedAt);
+
+  if (!trials.length) {
+    res.status(404).json({ error: 'No trials found for this student.' });
+    return;
+  }
+
+  const first = trials[0];
+  const payload = trials.map((trial) => ({
+    id: trial.id,
+    exam: {
+      id: trial.examId ?? 'general',
+      title: trial.examTitle ?? 'General Exam Pool',
+    },
+    trialNumber: trial.trialNumber ?? 1,
+    status: sessionStatus(trial),
+    startedAt: trial.startedAt,
+    submittedAt: trial.submittedAt,
+    expiresAt: trial.expiresAt,
+    durationSeconds: trial.durationSeconds,
+    summary: trial.summary ?? evaluateSession(trial),
+    violations: trial.violations ?? [],
+    feedback: trial.feedback ?? null,
+    questionReview: buildQuestionReview(trial),
+  }));
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    student: {
+      studentKey,
+      studentName: first.student?.fullName ?? 'Unknown',
+      classRoom: first.student?.classRoom ?? 'Unknown',
+      email: first.student?.email ?? '',
+      examId: first.examId ?? 'general',
+      examTitle: first.examTitle ?? 'General Exam Pool',
+    },
+    totalTrials: payload.length,
+    trials: payload,
+  });
+});
+
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  const search = normalizeName(req.query?.search ?? '').toLowerCase();
+  const classRoom = normalizeName(req.query?.classRoom ?? '');
+  const status = normalizeName(req.query?.status ?? '').toLowerCase();
+
+  const [users, sessions, helpRequests] = await Promise.all([
+    listUsers(),
+    getLatestSessions(),
+    listPasswordAssistanceRequests(),
+  ]);
+  const openHelpByUserKey = new Map();
+  for (const request of helpRequests) {
+    if (request.status === 'resolved') {
+      continue;
+    }
+    const key = request.userKey ?? '';
+    openHelpByUserKey.set(key, (openHelpByUserKey.get(key) ?? 0) + 1);
+  }
+
+  const rows = users
+    .map((user) => {
+      const ownedSessions = sessions.filter((session) => studentOwnsSession(user, session));
+      const submitted = ownedSessions.filter((session) => session.submittedAt);
+      const bestFinalPercent = submitted.length
+        ? Math.max(...submitted.map((session) => Number(session.summary?.finalPercent ?? 0)))
+        : 0;
+      const latestTrialAt = ownedSessions.length
+        ? Math.max(...ownedSessions.map((session) => Number(session.startedAt) || 0))
+        : null;
+
+      return {
+        ...toPublicUserRecord(user),
+        totalTrials: ownedSessions.length,
+        submittedTrials: submitted.length,
+        bestFinalPercent: Number(bestFinalPercent.toFixed(2)),
+        latestTrialAt,
+        openHelpRequests: openHelpByUserKey.get(user.userKey) ?? 0,
+      };
+    })
+    .filter((row) => {
+      if (classRoom && row.classRoom !== classRoom) {
+        return false;
+      }
+
+      if (status === 'disabled' && !row.disabled) {
+        return false;
+      }
+      if (status === 'active' && row.disabled) {
+        return false;
+      }
+      if (status === 'must_change' && !row.mustChangePassword) {
+        return false;
+      }
+
+      if (!search) {
+        return true;
+      }
+
+      const haystack = `${row.fullName} ${row.email} ${row.userKey}`.toLowerCase();
+      return haystack.includes(search);
+    })
+    .sort((left, right) => {
+      if ((right.latestTrialAt ?? 0) !== (left.latestTrialAt ?? 0)) {
+        return (right.latestTrialAt ?? 0) - (left.latestTrialAt ?? 0);
+      }
+      return left.fullName.localeCompare(right.fullName);
+    });
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    total: rows.length,
+    users: rows,
+  });
+});
+
+app.patch('/api/admin/users/:userId', requireAdmin, async (req, res) => {
+  const userId = normalizeName(req.params.userId);
+  if (!userId) {
+    res.status(400).json({ error: 'User ID is required.' });
+    return;
+  }
+
+  const patch = {};
+  if (req.body?.fullName !== undefined) {
+    const fullName = normalizeName(req.body.fullName);
+    if (fullName.length < 5) {
+      res.status(400).json({ error: 'Full name must be at least 5 characters.' });
+      return;
+    }
+    patch.fullName = fullName;
+  }
+  if (req.body?.classRoom !== undefined) {
+    const classRoom = normalizeName(req.body.classRoom);
+    if (!CLASS_OPTIONS.includes(classRoom)) {
+      res.status(400).json({ error: 'Please choose a valid class.' });
+      return;
+    }
+    patch.classRoom = classRoom;
+  }
+  if (req.body?.email !== undefined) {
+    const email = normalizeEmail(req.body.email);
+    if (!isValidEmail(email)) {
+      res.status(400).json({ error: 'Please provide a valid email.' });
+      return;
+    }
+    patch.email = email;
+  }
+  if (req.body?.disabled !== undefined) {
+    patch.disabled = Boolean(req.body.disabled);
+  }
+  if (req.body?.mustChangePassword !== undefined) {
+    patch.mustChangePassword = Boolean(req.body.mustChangePassword);
+  }
+
+  if (!Object.keys(patch).length) {
+    res.status(400).json({ error: 'No changes provided.' });
+    return;
+  }
+
+  try {
+    const updated = await updateUser(userId, patch);
+    if (!updated) {
+      res.status(404).json({ error: 'User not found.' });
+      return;
+    }
+
+    if (updated.disabled) {
+      revokeStudentTokensForUser(updated.id);
+    }
+
+    res.json({
+      ok: true,
+      user: toPublicUserRecord(updated),
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Could not update user.' });
+  }
+});
+
+app.post('/api/admin/users/:userId/password', requireAdmin, async (req, res) => {
+  const userId = normalizeName(req.params.userId);
+  if (!userId) {
+    res.status(400).json({ error: 'User ID is required.' });
+    return;
+  }
+
+  const user = await getUserById(userId);
+  if (!user) {
+    res.status(404).json({ error: 'User not found.' });
+    return;
+  }
+
+  const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+  if (newPassword.length < 4) {
+    res.status(400).json({ error: 'New password must be at least 4 characters.' });
+    return;
+  }
+
+  const nextHash = hashPasswordScrypt(newPassword);
+  const updated = await updateUserPassword(user.id, nextHash, {
+    mustChangePassword: req.body?.mustChangePassword !== false,
+  });
+  revokeStudentTokensForUser(user.id);
+
+  res.json({
+    ok: true,
+    user: toPublicUserRecord(updated),
+  });
+});
+
+app.get('/api/admin/password-help', requireAdmin, async (req, res) => {
+  const status = normalizeName(req.query?.status ?? '').toLowerCase();
+  const search = normalizeName(req.query?.search ?? '').toLowerCase();
+  const rows = await listPasswordAssistanceRequests();
+
+  const filtered = rows
+    .filter((row) => {
+      if (status && status !== 'all' && row.status !== status) {
+        return false;
+      }
+
+      if (!search) {
+        return true;
+      }
+
+      const haystack = `${row.fullName} ${row.classRoom} ${row.email} ${row.message}`.toLowerCase();
+      return haystack.includes(search);
+    })
+    .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0));
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    total: filtered.length,
+    requests: filtered,
+  });
+});
+
+app.patch('/api/admin/password-help/:requestId/resolve', requireAdmin, async (req, res) => {
+  const requestId = normalizeName(req.params.requestId);
+  if (!requestId) {
+    res.status(400).json({ error: 'Request ID is required.' });
+    return;
+  }
+
+  const updated = await resolvePasswordAssistanceRequest(requestId, 'admin');
+  if (!updated) {
+    res.status(404).json({ error: 'Password-help request not found.' });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    request: updated,
+  });
+});
+
+app.get('/api/admin/exams', requireAdmin, async (_req, res) => {
+  const [exams, questionPool, questionMap] = await Promise.all([
+    listExams(),
+    getQuestionPool(),
+    getQuestionByIdMap(),
+  ]);
+
+  const rows = exams.map((exam) => {
+    const availableQuestionCount = pickExamQuestionSet(exam, questionPool, questionMap).length;
+    return {
+      ...toPublicExam(exam),
+      availableQuestionCount,
+      isReady: availableQuestionCount >= exam.questionCount,
+    };
+  });
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    exams: rows,
+  });
+});
+
+app.get('/api/admin/exams/:examId', requireAdmin, async (req, res) => {
+  const examId = normalizeExamId(req.params.examId);
+  if (!examId) {
+    res.status(400).json({ error: 'Invalid exam ID.' });
+    return;
+  }
+
+  const [exam, questionPool, questionMap] = await Promise.all([
+    getExam(examId),
+    getQuestionPool(),
+    getQuestionByIdMap(),
+  ]);
+
+  if (!exam) {
+    res.status(404).json({ error: 'Exam not found.' });
+    return;
+  }
+
+  const questions = pickExamQuestionSet(exam, questionPool, questionMap);
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    exam: {
+      ...toPublicExam(exam),
+      availableQuestionCount: questions.length,
+      isReady: questions.length >= exam.questionCount,
+    },
+    questions: questions.map(questionToAdminRow),
+  });
+});
+
+app.post('/api/admin/exams', requireAdmin, async (req, res) => {
+  const title = normalizeName(req.body?.title);
+  if (title.length < 3) {
+    res.status(400).json({ error: 'Exam title must be at least 3 characters.' });
+    return;
+  }
+
+  const questionDrafts = Array.isArray(req.body?.questions) ? req.body.questions : [];
+  if (!questionDrafts.length) {
+    res.status(400).json({ error: 'Add at least one question to create a new exam.' });
+    return;
+  }
+
+  try {
+    const baseExam = await createExam({
+      id: req.body?.id,
+      title,
+      description: req.body?.description,
+      mode: 'pool',
+      questionCount: Number(req.body?.questionCount) || questionDrafts.length,
+      durationSeconds: req.body?.durationSeconds,
+      maxAttempts: req.body?.maxAttempts,
+      allowedClasses: req.body?.allowedClasses,
+      published: req.body?.published,
+      proctoring: req.body?.proctoring,
+      isDefault: false,
+    });
+
+    const createdQuestions = [];
+    for (const draft of questionDrafts) {
+      const createdQuestion = await addQuestion({
+        ...draft,
+        sourceExamId: baseExam.id,
+      });
+      createdQuestions.push(createdQuestion);
+    }
+
+    const finalExam = await updateExam(baseExam.id, {
+      mode: 'fixed',
+      questionIds: createdQuestions.map((question) => question.id),
+      questionCount: Math.min(
+        Number(req.body?.questionCount) || createdQuestions.length,
+        createdQuestions.length
+      ),
+    });
+
+    res.status(201).json({
+      ok: true,
+      exam: toPublicExam(finalExam),
+      questionsAdded: createdQuestions.length,
+      questions: createdQuestions.map(questionToAdminRow),
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Could not create exam.' });
+  }
+});
+
+app.patch('/api/admin/exams/:examId', requireAdmin, async (req, res) => {
+  const examId = normalizeExamId(req.params.examId);
+  if (!examId) {
+    res.status(400).json({ error: 'Invalid exam ID.' });
+    return;
+  }
+
+  const patch = {};
+  if (req.body?.title !== undefined) {
+    patch.title = req.body.title;
+  }
+  if (req.body?.description !== undefined) {
+    patch.description = req.body.description;
+  }
+  if (req.body?.allowedClasses !== undefined) {
+    patch.allowedClasses = req.body.allowedClasses;
+  }
+  if (req.body?.published !== undefined) {
+    patch.published = req.body.published;
+  }
+  if (req.body?.durationSeconds !== undefined) {
+    patch.durationSeconds = req.body.durationSeconds;
+  }
+  if (req.body?.maxAttempts !== undefined) {
+    patch.maxAttempts = req.body.maxAttempts;
+  }
+  if (req.body?.questionCount !== undefined) {
+    patch.questionCount = req.body.questionCount;
+  }
+  if (req.body?.proctoring !== undefined) {
+    patch.proctoring = req.body.proctoring;
+  }
+
+  try {
+    const updated = await updateExam(examId, patch);
+    const [questionPool, questionMap] = await Promise.all([getQuestionPool(), getQuestionByIdMap()]);
+    const availableQuestionCount = pickExamQuestionSet(updated, questionPool, questionMap).length;
+
+    res.json({
+      ok: true,
+      exam: {
+        ...toPublicExam(updated),
+        availableQuestionCount,
+        isReady: availableQuestionCount >= updated.questionCount,
+      },
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Could not update exam.' });
+  }
+});
+
+app.get('/api/admin/questions', requireAdmin, async (_req, res) => {
+  const questionPool = await getQuestionPool();
+  const examIdFilter = normalizeExamId(_req.query?.examId ?? '');
+  const filteredPool = examIdFilter
+    ? questionPool.filter((question) => (question.sourceExamId ?? 'general') === examIdFilter)
+    : questionPool;
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    questionCount: filteredPool.length,
     requiredExamQuestionCount: EXAM_QUESTION_COUNT,
-    questions: questionPool.map(questionToAdminRow),
+    questions: filteredPool.map(questionToAdminRow),
   });
 });
 
@@ -1205,6 +2628,10 @@ app.get('/api/admin/export/sessions.csv', requireAdmin, async (_req, res) => {
       const summary = session.summary ?? evaluateSession(session);
       return {
         sessionId: session.id,
+        examId: session.examId ?? 'general',
+        examTitle: session.examTitle ?? 'General Exam Pool',
+        trialNumber: session.trialNumber ?? 1,
+        studentKey: session.studentKey ?? buildStudentKey(session.student, session.examId),
         fullName: session.student?.fullName ?? '',
         classRoom: session.student?.classRoom ?? '',
         email: session.student?.email ?? '',
@@ -1217,6 +2644,8 @@ app.get('/api/admin/export/sessions.csv', requireAdmin, async (_req, res) => {
         penaltyPoints: summary.penaltyPoints,
         finalPercent: summary.finalPercent,
         violationsCount: summary.violationsCount,
+        totalViolationsCount: summary.totalViolationsCount,
+        waivedViolationsCount: summary.waivedViolationsCount,
         feedbackRating: session.feedback?.rating ?? '',
         feedbackComment: session.feedback?.comment ?? '',
         feedbackSubmittedAtIso: session.feedback?.submittedAt
@@ -1274,6 +2703,7 @@ app.get('/api/admin/export/questions.csv', requireAdmin, async (_req, res) => {
 
   const rows = questionPool.map((question) => ({
     id: question.id,
+    sourceExamId: question.sourceExamId ?? 'general',
     topic: question.topic,
     type: question.type,
     text: question.text,
