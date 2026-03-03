@@ -2598,7 +2598,7 @@ function AdminPage() {
       )}
 
       {widgets.examManager && (
-      <section className="admin-grid-2 exam-manager-grid">
+      <section className="admin-grid-2 exam-manager-grid equal-height-grid">
         <article className="card-panel wide admin-card exam-general-card">
           <div className="panel-title-row">
             <h2>General Exam Settings</h2>
@@ -3107,7 +3107,7 @@ function AdminPage() {
       )}
 
       {widgets.questionManager && (
-      <section className="admin-grid-2">
+      <section className="admin-grid-2 equal-height-grid">
         <article className="card-panel wide admin-card">
           <div className="panel-title-row">
             <h2>Add Question to Pool</h2>
