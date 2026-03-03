@@ -3,6 +3,7 @@ import { getCollection } from './db.js';
 
 const COLLECTION_NAME = 'questions';
 let initialized = false;
+let initializingPromise = null;
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -123,22 +124,44 @@ async function ensureInitialized() {
     return;
   }
 
-  const collection = await getCollection(COLLECTION_NAME);
-  await collection.createIndex({ id: 1 }, { unique: true, name: 'idx_question_id' });
-  await collection.createIndex({ sourceExamId: 1 }, { name: 'idx_question_source_exam_id' });
-
-  const count = await collection.estimatedDocumentCount();
-  if (count === 0) {
-    const defaults = DEFAULT_QUESTION_BANK.map((item) =>
-      validateQuestion({ ...item, sourceExamId: item.sourceExamId ?? 'general' }, item.id)
-    );
-
-    if (defaults.length > 0) {
-      await collection.insertMany(defaults);
-    }
+  if (initializingPromise) {
+    await initializingPromise;
+    return;
   }
 
-  initialized = true;
+  initializingPromise = (async () => {
+    const collection = await getCollection(COLLECTION_NAME);
+    await collection.createIndex({ id: 1 }, { unique: true, name: 'idx_question_id' });
+    await collection.createIndex({ sourceExamId: 1 }, { name: 'idx_question_source_exam_id' });
+
+    const count = await collection.estimatedDocumentCount();
+    if (count === 0) {
+      const defaults = DEFAULT_QUESTION_BANK.map((item) =>
+        validateQuestion({ ...item, sourceExamId: item.sourceExamId ?? 'general' }, item.id)
+      );
+
+      if (defaults.length > 0) {
+        try {
+          await collection.insertMany(defaults, { ordered: false });
+        } catch (error) {
+          // If another concurrent initializer inserted rows first, ignore duplicate-key races.
+          if (error?.code !== 11000 && error?.name !== 'MongoBulkWriteError') {
+            throw error;
+          }
+        }
+      }
+    }
+
+    initialized = true;
+  })();
+
+  try {
+    await initializingPromise;
+  } finally {
+    if (!initialized) {
+      initializingPromise = null;
+    }
+  }
 }
 
 export async function getQuestionPool() {

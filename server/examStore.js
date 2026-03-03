@@ -9,6 +9,7 @@ const DEFAULT_MAX_ATTEMPTS = Number.isFinite(DEFAULT_MAX_ATTEMPTS_INPUT)
   : 3;
 
 let initialized = false;
+let initializingPromise = null;
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -217,16 +218,37 @@ async function ensureInitialized() {
     return;
   }
 
-  const collection = await getCollection(COLLECTION_NAME);
-  await collection.createIndex({ id: 1 }, { unique: true, name: 'idx_exam_id' });
-  await collection.createIndex({ published: 1 }, { name: 'idx_exam_published' });
-
-  const general = await collection.findOne({ id: 'general' });
-  if (!general) {
-    await collection.insertOne(defaultGeneralExam());
+  if (initializingPromise) {
+    await initializingPromise;
+    return;
   }
 
-  initialized = true;
+  initializingPromise = (async () => {
+    const collection = await getCollection(COLLECTION_NAME);
+    await collection.createIndex({ id: 1 }, { unique: true, name: 'idx_exam_id' });
+    await collection.createIndex({ published: 1 }, { name: 'idx_exam_published' });
+
+    const general = await collection.findOne({ id: 'general' });
+    if (!general) {
+      try {
+        await collection.insertOne(defaultGeneralExam());
+      } catch (error) {
+        if (error?.code !== 11000) {
+          throw error;
+        }
+      }
+    }
+
+    initialized = true;
+  })();
+
+  try {
+    await initializingPromise;
+  } finally {
+    if (!initialized) {
+      initializingPromise = null;
+    }
+  }
 }
 
 function buildUniqueExamId(existingExams, preferredId) {

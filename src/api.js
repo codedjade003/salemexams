@@ -97,27 +97,27 @@ export function fetchSession(token, sessionId) {
   });
 }
 
-export function markSeen(token, sessionId, questionId) {
+export function markSeen(token, sessionId, questionId, questionIndex = null) {
   return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/seen`, {
     method: 'POST',
     headers: withStudentHeaders(token),
-    body: JSON.stringify({ questionId }),
+    body: JSON.stringify({ questionId, questionIndex }),
   });
 }
 
-export function saveAnswer(token, sessionId, questionId, selectedOptionIds) {
+export function saveAnswer(token, sessionId, questionId, selectedOptionIds, questionIndex = null) {
   return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/answer`, {
     method: 'POST',
     headers: withStudentHeaders(token),
-    body: JSON.stringify({ questionId, selectedOptionIds }),
+    body: JSON.stringify({ questionId, selectedOptionIds, questionIndex }),
   });
 }
 
-export function saveFlag(token, sessionId, questionId, flagged) {
+export function saveFlag(token, sessionId, questionId, flagged, questionIndex = null) {
   return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/flag`, {
     method: 'POST',
     headers: withStudentHeaders(token),
-    body: JSON.stringify({ questionId, flagged }),
+    body: JSON.stringify({ questionId, flagged, questionIndex }),
   });
 }
 

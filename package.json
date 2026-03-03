@@ -11,6 +11,7 @@
     "hash:admin": "node scripts/hash-admin-password.mjs",
     "audit:sessions": "node scripts/audit-sessions.mjs",
     "audit:sessions:fix": "node scripts/audit-sessions.mjs --fix --finalize-expired",
+    "test:smoke": "node scripts/smoke-e2e.mjs",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"

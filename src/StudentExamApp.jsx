@@ -122,6 +122,7 @@ function StudentExamApp() {
   const [resultReleaseNow, setResultReleaseNow] = useState(Date.now());
 
   const violationThrottleRef = useRef(new Map());
+  const seenSyncBlockedRef = useRef(new Set());
   const autoSubmitTriggeredRef = useRef(false);
 
   const clearStoredSession = useCallback(() => {
@@ -310,6 +311,10 @@ function StudentExamApp() {
   }, []);
 
   useEffect(() => {
+    seenSyncBlockedRef.current.clear();
+  }, [session?.sessionId]);
+
+  useEffect(() => {
     if (!session || session.submittedAt) {
       clearStoredSession();
       return;
@@ -448,29 +453,26 @@ function StudentExamApp() {
   useEffect(() => {
     if (phase !== 'exam' || !session || !activeQuestion || !authToken) return;
     const questionId = activeQuestion.id;
+    if (seenSyncBlockedRef.current.has(questionId)) return;
     if (session.seen[questionId]) return;
 
     setSession((prev) => (prev ? { ...prev, seen: { ...prev.seen, [questionId]: true } } : prev));
 
-    void markSeen(authToken, session.sessionId, questionId).catch(async (error) => {
+    void markSeen(authToken, session.sessionId, questionId, currentIndex).catch(async (error) => {
       if (
         error?.status === 400 &&
         ['QUESTION_NOT_IN_SESSION', 'QUESTION_DETAILS_MISSING'].includes(error?.payload?.code)
       ) {
-        try {
-          const latest = await fetchSession(authToken, session.sessionId);
-          setSession(latest);
-          return;
-        } catch {
-          // fall through to standard error handling
-        }
+        seenSyncBlockedRef.current.add(questionId);
+        setInfoMessage('Sync warning: question read-state could not be saved for this item.');
+        return;
       }
 
       if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not save read status.');
       }
     });
-  }, [activeQuestion, adoptSessionFromError, authToken, handleUnauthorized, phase, session]);
+  }, [activeQuestion, adoptSessionFromError, authToken, currentIndex, handleUnauthorized, phase, session]);
 
   const startExamFullscreen = useCallback(async () => {
     if (document.fullscreenElement) return;
@@ -678,7 +680,7 @@ function StudentExamApp() {
         : current
     );
 
-    void saveAnswer(authToken, session.sessionId, question.id, selected).catch(async (error) => {
+    void saveAnswer(authToken, session.sessionId, question.id, selected, currentIndex).catch(async (error) => {
       if (
         error?.status === 400 &&
         ['QUESTION_NOT_IN_SESSION', 'QUESTION_DETAILS_MISSING'].includes(error?.payload?.code)
@@ -703,7 +705,8 @@ function StudentExamApp() {
             authToken,
             latest.sessionId,
             fallbackQuestion.id,
-            fallbackSelected
+            fallbackSelected,
+            currentIndex
           );
 
           setSession({
@@ -741,7 +744,7 @@ function StudentExamApp() {
         : current
     );
 
-    void saveAnswer(authToken, session.sessionId, activeQuestion.id, []).catch(async (error) => {
+    void saveAnswer(authToken, session.sessionId, activeQuestion.id, [], currentIndex).catch(async (error) => {
       if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not clear answer.');
       }
@@ -764,7 +767,13 @@ function StudentExamApp() {
         : current
     );
 
-    void saveFlag(authToken, session.sessionId, activeQuestion.id, nextFlagged).catch(async (error) => {
+    void saveFlag(
+      authToken,
+      session.sessionId,
+      activeQuestion.id,
+      nextFlagged,
+      currentIndex
+    ).catch(async (error) => {
       if (
         error?.status === 400 &&
         ['QUESTION_NOT_IN_SESSION', 'QUESTION_DETAILS_MISSING'].includes(error?.payload?.code)

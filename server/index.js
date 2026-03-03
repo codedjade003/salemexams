@@ -297,10 +297,18 @@ function normalizeQuestionId(value) {
   return normalizeName(value).toUpperCase();
 }
 
-function resolveSessionQuestionId(session, requestedQuestionId) {
+function resolveSessionQuestionId(session, requestedQuestionId, requestedQuestionIndex = null) {
   const order = Array.isArray(session?.questionOrder) ? session.questionOrder : [];
   if (!order.length) {
     return null;
+  }
+
+  const indexValue = Number(requestedQuestionIndex);
+  if (Number.isFinite(indexValue)) {
+    const safeIndex = Math.trunc(indexValue);
+    if (safeIndex >= 0 && safeIndex < order.length) {
+      return order[safeIndex];
+    }
   }
 
   if (order.includes(requestedQuestionId)) {
@@ -1775,18 +1783,26 @@ app.get('/api/exam/:sessionId', requireStudent, async (req, res) => {
 app.post('/api/exam/:sessionId/seen', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
   const requestedQuestionId = req.body?.questionId;
+  const requestedQuestionIndex = req.body?.questionIndex;
 
   const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
   if (!session) {
     return;
   }
 
-  const questionId = resolveSessionQuestionId(session, requestedQuestionId);
+  const questionId = resolveSessionQuestionId(session, requestedQuestionId, requestedQuestionIndex);
   if (!questionId) {
     res.status(400).json({
       error: 'Question is not in this exam session.',
       code: 'QUESTION_NOT_IN_SESSION',
       questionId: requestedQuestionId ?? null,
+      questionIndex: Number.isFinite(Number(requestedQuestionIndex))
+        ? Math.trunc(Number(requestedQuestionIndex))
+        : null,
+      sessionQuestionOrderSize: Array.isArray(session.questionOrder) ? session.questionOrder.length : 0,
+      sessionQuestionOrderSample: Array.isArray(session.questionOrder)
+        ? session.questionOrder.slice(0, 3)
+        : [],
     });
     return;
   }
@@ -1805,18 +1821,26 @@ app.post('/api/exam/:sessionId/seen', requireStudent, async (req, res) => {
 app.post('/api/exam/:sessionId/answer', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
   const requestedQuestionId = req.body?.questionId;
+  const requestedQuestionIndex = req.body?.questionIndex;
 
   const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
   if (!session) {
     return;
   }
 
-  const questionId = resolveSessionQuestionId(session, requestedQuestionId);
+  const questionId = resolveSessionQuestionId(session, requestedQuestionId, requestedQuestionIndex);
   if (!questionId) {
     res.status(400).json({
       error: 'Question is not in this exam session.',
       code: 'QUESTION_NOT_IN_SESSION',
       questionId: requestedQuestionId ?? null,
+      questionIndex: Number.isFinite(Number(requestedQuestionIndex))
+        ? Math.trunc(Number(requestedQuestionIndex))
+        : null,
+      sessionQuestionOrderSize: Array.isArray(session.questionOrder) ? session.questionOrder.length : 0,
+      sessionQuestionOrderSample: Array.isArray(session.questionOrder)
+        ? session.questionOrder.slice(0, 3)
+        : [],
     });
     return;
   }
@@ -1857,6 +1881,7 @@ app.post('/api/exam/:sessionId/answer', requireStudent, async (req, res) => {
 app.post('/api/exam/:sessionId/flag', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
   const requestedQuestionId = req.body?.questionId;
+  const requestedQuestionIndex = req.body?.questionIndex;
   const flagged = Boolean(req.body?.flagged);
 
   const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
@@ -1864,12 +1889,19 @@ app.post('/api/exam/:sessionId/flag', requireStudent, async (req, res) => {
     return;
   }
 
-  const questionId = resolveSessionQuestionId(session, requestedQuestionId);
+  const questionId = resolveSessionQuestionId(session, requestedQuestionId, requestedQuestionIndex);
   if (!questionId) {
     res.status(400).json({
       error: 'Question is not in this exam session.',
       code: 'QUESTION_NOT_IN_SESSION',
       questionId: requestedQuestionId ?? null,
+      questionIndex: Number.isFinite(Number(requestedQuestionIndex))
+        ? Math.trunc(Number(requestedQuestionIndex))
+        : null,
+      sessionQuestionOrderSize: Array.isArray(session.questionOrder) ? session.questionOrder.length : 0,
+      sessionQuestionOrderSample: Array.isArray(session.questionOrder)
+        ? session.questionOrder.slice(0, 3)
+        : [],
     });
     return;
   }
@@ -2909,6 +2941,26 @@ app.get('/api/admin/export/questions.json', requireAdmin, async (_req, res) => {
 
   res.setHeader('Content-Disposition', 'attachment; filename="questions-export.json"');
   res.json(questionPool);
+});
+
+app.use((error, req, res, next) => {
+  console.error(
+    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} failed:`,
+    error?.stack || error?.message || error
+  );
+
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+
+  const status = Number.isInteger(error?.status) && error.status >= 400 ? error.status : 500;
+  const message =
+    status === 500
+      ? 'Internal server error. Please retry.'
+      : error?.message || 'Request failed.';
+
+  res.status(status).json({ error: message });
 });
 
 const distPath = path.resolve(process.cwd(), 'dist');
