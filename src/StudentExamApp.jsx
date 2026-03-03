@@ -66,6 +66,20 @@ function formatDateTime(value) {
   }
 }
 
+function formatSelectedOptions(question, responses) {
+  const selectedOptionIds = responses?.[question?.id] ?? [];
+  if (!selectedOptionIds.length) {
+    return 'No answer';
+  }
+
+  return selectedOptionIds
+    .map((optionId) => {
+      const option = (question?.options ?? []).find((item) => item.id === optionId);
+      return option ? `${optionId}. ${option.text}` : optionId;
+    })
+    .join(' | ');
+}
+
 function getQuestionStatus(questionId, seen, responses, flagged) {
   if (!seen[questionId]) return 'unread';
   if (flagged[questionId]) return 'flagged';
@@ -105,6 +119,7 @@ function StudentExamApp() {
   const [isReviewLoading, setIsReviewLoading] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
   const [feedbackForm, setFeedbackForm] = useState({ rating: '', comment: '' });
+  const [resultReleaseNow, setResultReleaseNow] = useState(Date.now());
 
   const violationThrottleRef = useRef(new Map());
   const autoSubmitTriggeredRef = useRef(false);
@@ -331,6 +346,58 @@ function StudentExamApp() {
     () => dashboard?.exams?.find((exam) => exam.id === selectedExamId) ?? null,
     [dashboard?.exams, selectedExamId]
   );
+  const resultsLocked = Boolean(session?.submittedAt && session?.resultsReleased === false);
+  const resultReleaseInSeconds =
+    resultsLocked && session?.resultsAvailableAt
+      ? Math.max(0, Math.ceil((session.resultsAvailableAt - resultReleaseNow) / 1000))
+      : 0;
+
+  useEffect(() => {
+    if (!resultsLocked) {
+      return undefined;
+    }
+
+    const intervalId = setInterval(() => {
+      setResultReleaseNow(Date.now());
+    }, 1000);
+
+    return () => clearInterval(intervalId);
+  }, [resultsLocked]);
+
+  useEffect(() => {
+    if (!resultsLocked || resultReleaseInSeconds > 0 || !authToken || !session?.sessionId) {
+      return;
+    }
+
+    let cancelled = false;
+    const loadUnlockedSession = async () => {
+      try {
+        const latest = await fetchSession(authToken, session.sessionId);
+        if (cancelled) {
+          return;
+        }
+
+        setSession(latest);
+        if (latest?.resultsReleased) {
+          setInfoMessage('Corrections are now available.');
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || 'Could not load released corrections yet.');
+        }
+      }
+    };
+
+    void loadUnlockedSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken, handleUnauthorized, resultReleaseInSeconds, resultsLocked, session?.sessionId]);
 
   const handleSubmit = useCallback(
     async (trigger = 'manual') => {
@@ -1043,6 +1110,7 @@ function StudentExamApp() {
                     <th>Final %</th>
                     <th>Violations</th>
                     <th>Started</th>
+                    <th>Corrections</th>
                     <th>Action</th>
                   </tr>
                 </thead>
@@ -1054,9 +1122,18 @@ function StudentExamApp() {
                       </td>
                       <td>#{trial.trialNumber ?? 1}</td>
                       <td>{trial.status}</td>
-                      <td>{trial.summary?.finalPercent ?? 0}%</td>
-                      <td>{trial.summary?.totalViolationsCount ?? trial.summary?.violationsCount ?? 0}</td>
+                      <td>{trial.resultsReleased ? `${trial.summary?.finalPercent ?? 0}%` : 'Locked'}</td>
+                      <td>
+                        {trial.resultsReleased
+                          ? trial.summary?.totalViolationsCount ?? trial.summary?.violationsCount ?? 0
+                          : '-'}
+                      </td>
                       <td>{formatDateTime(trial.startedAt)}</td>
+                      <td>
+                        {trial.resultsReleased
+                          ? 'Open'
+                          : `Opens ${formatDateTime(trial.resultsAvailableAt)}`}
+                      </td>
                       <td className="cell-tight">
                         <button
                           type="button"
@@ -1071,7 +1148,7 @@ function StudentExamApp() {
                   ))}
                   {!(dashboard?.trials ?? []).length && (
                     <tr>
-                      <td colSpan={7}>No trials yet.</td>
+                      <td colSpan={8}>No trials yet.</td>
                     </tr>
                   )}
                 </tbody>
@@ -1085,6 +1162,65 @@ function StudentExamApp() {
               Logout
             </button>
           </div>
+
+          {trialReview && (
+            <div className="modal-backdrop" onClick={() => setTrialReview(null)}>
+              <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+                <div className="panel-title-row">
+                  <h2>
+                    Trial Review: {trialReview.exam?.title} #{trialReview.trialNumber}
+                  </h2>
+                  <button type="button" className="btn btn-outline btn-xs" onClick={() => setTrialReview(null)}>
+                    Close
+                  </button>
+                </div>
+                {trialReview.resultsReleased === false && (
+                  <p className="muted">
+                    Corrections are locked until <strong>{formatDateTime(trialReview.resultsAvailableAt)}</strong>.
+                    You can still see the answers you selected.
+                  </p>
+                )}
+
+                <div className="table-wrap large">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Question</th>
+                        <th>Selected</th>
+                        <th>Correct</th>
+                        <th>Result</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(trialReview.questionReview ?? []).map((item) => (
+                        <tr key={`${trialReview.id}-${item.questionId}`}>
+                          <td>{item.index}</td>
+                          <td title={item.text}>
+                            <span className="truncate-2">{item.text}</span>
+                          </td>
+                          <td>{(item.selectedOptionIds ?? []).join(', ') || '-'}</td>
+                          <td>{(item.correctOptionIds ?? []).join(', ') || '-'}</td>
+                          <td>
+                            {item.isCorrect === null || item.isCorrect === undefined
+                              ? 'Locked'
+                              : item.isCorrect
+                                ? 'Correct'
+                                : 'Wrong'}
+                          </td>
+                        </tr>
+                      ))}
+                      {!(trialReview.questionReview ?? []).length && (
+                        <tr>
+                          <td colSpan={5}>No review data available.</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </main>
     );
@@ -1145,40 +1281,82 @@ function StudentExamApp() {
             <strong>#{session.trialNumber ?? 1}</strong>
           </p>
 
-          <div className="result-grid">
-            <div className="result-box">
-              <span>Answered</span>
-              <strong>
-                {summary?.answeredCount ?? 0}/{summary?.totalQuestions ?? 40}
-              </strong>
+          {!resultsLocked && (
+            <div className="result-grid">
+              <div className="result-box">
+                <span>Answered</span>
+                <strong>
+                  {summary?.answeredCount ?? 0}/{summary?.totalQuestions ?? 40}
+                </strong>
+              </div>
+              <div className="result-box">
+                <span>Correct</span>
+                <strong>
+                  {summary?.correctCount ?? 0}/{summary?.totalQuestions ?? 40}
+                </strong>
+              </div>
+              <div className="result-box">
+                <span>Raw Score</span>
+                <strong>{summary?.rawPercent ?? 0}%</strong>
+              </div>
+              <div className="result-box">
+                <span>Active Violations</span>
+                <strong>{summary?.violationsCount ?? 0}</strong>
+              </div>
+              <div className="result-box">
+                <span>Total Violations</span>
+                <strong>{summary?.totalViolationsCount ?? 0}</strong>
+              </div>
+              <div className="result-box final">
+                <span>Final Score</span>
+                <strong>{summary?.finalPercent ?? 0}%</strong>
+              </div>
             </div>
-            <div className="result-box">
-              <span>Correct</span>
-              <strong>
-                {summary?.correctCount ?? 0}/{summary?.totalQuestions ?? 40}
-              </strong>
+          )}
+
+          {resultsLocked && (
+            <div className="feedback-panel">
+              <h3>Corrections Locked</h3>
+              <p className="muted">
+                Results and corrections will open in <strong>{formatTime(resultReleaseInSeconds)}</strong>.
+              </p>
+              <p className="muted">
+                Opens at <strong>{formatDateTime(session.resultsAvailableAt)}</strong>.
+              </p>
             </div>
-            <div className="result-box">
-              <span>Raw Score</span>
-              <strong>{summary?.rawPercent ?? 0}%</strong>
-            </div>
-            <div className="result-box">
-              <span>Active Violations</span>
-              <strong>{summary?.violationsCount ?? 0}</strong>
-            </div>
-            <div className="result-box">
-              <span>Total Violations</span>
-              <strong>{summary?.totalViolationsCount ?? 0}</strong>
-            </div>
-            <div className="result-box final">
-              <span>Final Score</span>
-              <strong>{summary?.finalPercent ?? 0}%</strong>
-            </div>
-          </div>
+          )}
 
           <p className="muted">
             Results will be sent to <strong>{session.student.email}</strong> before end of day.
           </p>
+
+          <div className="feedback-panel">
+            <h3>Your Selected Answers</h3>
+            <div className="table-wrap medium">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Question</th>
+                    <th>Your Answer</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(session.questions ?? []).map((question, index) => (
+                    <tr key={`${session.sessionId}-${question.id}`}>
+                      <td>{index + 1}</td>
+                      <td title={question.text}>
+                        <span className="truncate-2">{question.text}</span>
+                      </td>
+                      <td title={formatSelectedOptions(question, session.responses)}>
+                        <span className="truncate-2">{formatSelectedOptions(question, session.responses)}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
 
           <form className="feedback-panel" onSubmit={handleSaveFeedback}>
             <h3>Optional Rating & Feedback</h3>
@@ -1427,52 +1605,6 @@ function StudentExamApp() {
         </div>
       )}
 
-      {trialReview && (
-        <div className="modal-backdrop" onClick={() => setTrialReview(null)}>
-          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <div className="panel-title-row">
-              <h2>
-                Trial Review: {trialReview.exam?.title} #{trialReview.trialNumber}
-              </h2>
-              <button type="button" className="btn btn-outline btn-xs" onClick={() => setTrialReview(null)}>
-                Close
-              </button>
-            </div>
-
-            <div className="table-wrap large">
-              <table>
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>Question</th>
-                    <th>Selected</th>
-                    <th>Correct</th>
-                    <th>Result</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(trialReview.questionReview ?? []).map((item) => (
-                    <tr key={`${trialReview.id}-${item.questionId}`}>
-                      <td>{item.index}</td>
-                      <td title={item.text}>
-                        <span className="truncate-2">{item.text}</span>
-                      </td>
-                      <td>{(item.selectedOptionIds ?? []).join(', ') || '-'}</td>
-                      <td>{(item.correctOptionIds ?? []).join(', ') || '-'}</td>
-                      <td>{item.isCorrect ? 'Correct' : 'Wrong'}</td>
-                    </tr>
-                  ))}
-                  {!(trialReview.questionReview ?? []).length && (
-                    <tr>
-                      <td colSpan={5}>No review data available.</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
     </main>
   );
 }

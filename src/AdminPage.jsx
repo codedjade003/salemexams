@@ -121,6 +121,8 @@ const EMPTY_EXAM_FORM = {
   questionCount: 40,
   published: true,
   allowedClasses: [],
+  deductRightClick: false,
+  deductRestrictedKey: false,
 };
 
 const EMPTY_EXAM_QUESTION_FORM = {
@@ -212,6 +214,8 @@ function AdminPage() {
     questionCount: 40,
     published: true,
     allowedClasses: [],
+    deductRightClick: false,
+    deductRestrictedKey: false,
   });
 
   const [loading, setLoading] = useState({
@@ -340,6 +344,8 @@ function AdminPage() {
             questionCount: generalExam.questionCount,
             published: generalExam.published,
             allowedClasses: generalExam.allowedClasses ?? [],
+            deductRightClick: Boolean(generalExam.proctoring?.deductRightClick),
+            deductRestrictedKey: Boolean(generalExam.proctoring?.deductRestrictedKey),
           });
         }
       } catch (error) {
@@ -737,6 +743,12 @@ function AdminPage() {
         questionCount: Number(examForm.questionCount) || examQuestionDrafts.length,
         published: Boolean(examForm.published),
         allowedClasses: examForm.allowedClasses,
+        proctoring: {
+          right_click: true,
+          restricted_key: true,
+          deductRightClick: Boolean(examForm.deductRightClick),
+          deductRestrictedKey: Boolean(examForm.deductRestrictedKey),
+        },
         questions: examQuestionDrafts,
       });
 
@@ -745,6 +757,8 @@ function AdminPage() {
         durationSeconds: previous.durationSeconds,
         maxAttempts: previous.maxAttempts,
         questionCount: previous.questionCount,
+        deductRightClick: previous.deductRightClick,
+        deductRestrictedKey: previous.deductRestrictedKey,
       }));
       setExamQuestionForm(EMPTY_EXAM_QUESTION_FORM);
       setExamQuestionDrafts([]);
@@ -786,6 +800,12 @@ function AdminPage() {
         questionCount: Number(generalExamEdit.questionCount),
         published: Boolean(generalExamEdit.published),
         allowedClasses: generalExamEdit.allowedClasses,
+        proctoring: {
+          right_click: true,
+          restricted_key: true,
+          deductRightClick: Boolean(generalExamEdit.deductRightClick),
+          deductRestrictedKey: Boolean(generalExamEdit.deductRestrictedKey),
+        },
       });
       await Promise.all([loadExams(token), loadOverview(token)]);
       setInfoMessage(`Saved: ${payload.exam?.title ?? 'General exam'}.`);
@@ -2432,6 +2452,41 @@ function AdminPage() {
               }
             />
 
+            <label>Right Click and Special Keys</label>
+            <div className="class-chip-grid">
+              <label className={`widget-toggle ${generalExamEdit.deductRightClick ? 'on' : ''}`}>
+                <input
+                  type="checkbox"
+                  checked={generalExamEdit.deductRightClick}
+                  onChange={(event) =>
+                    setGeneralExamEdit((previous) => ({
+                      ...previous,
+                      deductRightClick: event.target.checked,
+                    }))
+                  }
+                />
+                <span>Right click: {generalExamEdit.deductRightClick ? 'Deduct marks' : 'Lock only'}</span>
+              </label>
+              <label className={`widget-toggle ${generalExamEdit.deductRestrictedKey ? 'on' : ''}`}>
+                <input
+                  type="checkbox"
+                  checked={generalExamEdit.deductRestrictedKey}
+                  onChange={(event) =>
+                    setGeneralExamEdit((previous) => ({
+                      ...previous,
+                      deductRestrictedKey: event.target.checked,
+                    }))
+                  }
+                />
+                <span>
+                  Special keys: {generalExamEdit.deductRestrictedKey ? 'Deduct marks' : 'Lock only'}
+                </span>
+              </label>
+            </div>
+            <p className="muted">
+              Default behavior is lock-only for right click and special keys. Turn on deduction only for stricter exams.
+            </p>
+
             <label>Allowed Classes</label>
             <div className="class-chip-grid">
               {(meta?.classOptions ?? []).map((classOption) => (
@@ -2547,6 +2602,39 @@ function AdminPage() {
                 }))
               }
             />
+
+            <label>Right Click and Special Keys</label>
+            <div className="class-chip-grid">
+              <label className={`widget-toggle ${examForm.deductRightClick ? 'on' : ''}`}>
+                <input
+                  type="checkbox"
+                  checked={examForm.deductRightClick}
+                  onChange={(event) =>
+                    setExamForm((previous) => ({
+                      ...previous,
+                      deductRightClick: event.target.checked,
+                    }))
+                  }
+                />
+                <span>Right click: {examForm.deductRightClick ? 'Deduct marks' : 'Lock only'}</span>
+              </label>
+              <label className={`widget-toggle ${examForm.deductRestrictedKey ? 'on' : ''}`}>
+                <input
+                  type="checkbox"
+                  checked={examForm.deductRestrictedKey}
+                  onChange={(event) =>
+                    setExamForm((previous) => ({
+                      ...previous,
+                      deductRestrictedKey: event.target.checked,
+                    }))
+                  }
+                />
+                <span>Special keys: {examForm.deductRestrictedKey ? 'Deduct marks' : 'Lock only'}</span>
+              </label>
+            </div>
+            <p className="muted">
+              Lock-only is recommended for practice; enable deduction for strict assessments.
+            </p>
 
             <label>Allowed Classes</label>
             <div className="class-chip-grid">

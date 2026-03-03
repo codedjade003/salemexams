@@ -43,6 +43,11 @@ const PENALTY_PER_VIOLATION = 2;
 const ADMIN_PASSCODE_HASH = process.env.ADMIN_PASSCODE_HASH ?? '';
 const ADMIN_TOKEN_LIFETIME_MS = 12 * 60 * 60 * 1000;
 const STUDENT_TOKEN_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
+const RESULT_RELEASE_DELAY_MS_INPUT = Number(process.env.RESULT_RELEASE_DELAY_MS ?? 25 * 60 * 1000);
+const RESULT_RELEASE_DELAY_MS =
+  Number.isFinite(RESULT_RELEASE_DELAY_MS_INPUT) && RESULT_RELEASE_DELAY_MS_INPUT >= 0
+    ? Math.round(RESULT_RELEASE_DELAY_MS_INPUT)
+    : 25 * 60 * 1000;
 const OPTION_IDS = ['A', 'B', 'C', 'D'];
 const KEEP_ALIVE_ENABLED = String(process.env.KEEP_ALIVE_ENABLED ?? 'true').toLowerCase() === 'true';
 const KEEP_ALIVE_URL = String(process.env.KEEP_ALIVE_URL ?? '').trim();
@@ -92,8 +97,8 @@ function normalizeProctoringPolicy(value = {}) {
     deductTabSwitch: source.deductTabSwitch !== false,
     deductWindowBlur: source.deductWindowBlur !== false,
     deductFullscreenExit: source.deductFullscreenExit !== false,
-    deductRightClick: source.deductRightClick !== false,
-    deductRestrictedKey: source.deductRestrictedKey !== false,
+    deductRightClick: source.deductRightClick === true,
+    deductRestrictedKey: source.deductRestrictedKey === true,
   };
 }
 
@@ -387,6 +392,28 @@ function violationsEqual(left, right) {
   return true;
 }
 
+function getResultsAvailableAt(session) {
+  if (!session?.submittedAt) {
+    return null;
+  }
+
+  const storedValue = Number(session.resultsAvailableAt);
+  if (Number.isFinite(storedValue) && storedValue > 0) {
+    return storedValue;
+  }
+
+  return Number(session.submittedAt) + RESULT_RELEASE_DELAY_MS;
+}
+
+function isResultsReleased(session) {
+  const resultsAvailableAt = getResultsAvailableAt(session);
+  if (!resultsAvailableAt) {
+    return false;
+  }
+
+  return Date.now() >= resultsAvailableAt;
+}
+
 function toClientSession(session) {
   const durationSeconds = session.durationSeconds ?? EXAM_DURATION_SECONDS;
   const remainingSeconds = session.submittedAt
@@ -419,6 +446,8 @@ function toClientSession(session) {
     seen: session.seen,
     violations: session.violations,
     submittedAt: session.submittedAt,
+    resultsAvailableAt: getResultsAvailableAt(session),
+    resultsReleased: isResultsReleased(session),
     summary: session.summary,
     feedback: session.feedback ?? null,
   };
@@ -481,6 +510,9 @@ async function normalizeSession(session) {
     const linkedUser = await getUserByKey(userKey);
     userId = linkedUser?.id ?? '';
   }
+  const resultsAvailableAt = session.submittedAt
+    ? getResultsAvailableAt(session)
+    : null;
 
   let next = {
     ...session,
@@ -500,6 +532,7 @@ async function normalizeSession(session) {
     violations: normalizedViolations,
     questionOrder: Array.isArray(session.questionOrder) ? session.questionOrder : [],
     feedback: normalizeStoredFeedback(session.feedback),
+    resultsAvailableAt,
   };
 
   let changed =
@@ -514,6 +547,7 @@ async function normalizeSession(session) {
     studentKey !== (session.studentKey ?? '') ||
     userKey !== (session.userKey ?? '') ||
     (userId || null) !== (session.userId ?? null) ||
+    (resultsAvailableAt ?? null) !== (session.resultsAvailableAt ?? null) ||
     next.durationSeconds !== session.durationSeconds ||
     next.answers !== session.answers ||
     next.flagged !== session.flagged ||
@@ -583,14 +617,14 @@ async function getUpdatableSessionOrError(sessionId, res, studentUser = null) {
   }
 
   if (session.submittedAt) {
-    res.status(409).json({ error: 'Exam already submitted.', session: toClientSession(session) });
+    res.status(409).json({ error: 'Exam already submitted.', session: toStudentClientSession(session) });
     return null;
   }
 
   if (Date.now() >= session.expiresAt) {
     const finalized = finalizeSession(session);
     await saveSession(finalized);
-    res.status(409).json({ error: 'Exam time is over.', session: toClientSession(finalized) });
+    res.status(409).json({ error: 'Exam time is over.', session: toStudentClientSession(finalized) });
     return null;
   }
 
@@ -784,6 +818,7 @@ function toSessionRow(session) {
 }
 
 function toStudentTrialRow(session) {
+  const released = isResultsReleased(session);
   return {
     id: session.id,
     exam: {
@@ -796,8 +831,10 @@ function toStudentTrialRow(session) {
     startedAt: session.startedAt,
     submittedAt: session.submittedAt,
     expiresAt: session.expiresAt,
+    resultsAvailableAt: getResultsAvailableAt(session),
+    resultsReleased: released,
     durationSeconds: session.durationSeconds ?? EXAM_DURATION_SECONDS,
-    summary: session.summary ?? evaluateSession(session),
+    summary: released ? session.summary ?? evaluateSession(session) : null,
     violations: session.violations ?? [],
     feedback: session.feedback ?? null,
   };
@@ -1111,6 +1148,36 @@ function buildQuestionReview(session) {
     .filter(Boolean);
 }
 
+function buildStudentQuestionReview(session) {
+  const released = isResultsReleased(session);
+  const baseReview = buildQuestionReview(session);
+  if (released) {
+    return baseReview;
+  }
+
+  return baseReview.map((item) => ({
+    ...item,
+    correctOptionIds: [],
+    isCorrect: null,
+  }));
+}
+
+function toStudentClientSession(session) {
+  const base = toClientSession(session);
+  if (!session.submittedAt) {
+    return base;
+  }
+
+  if (isResultsReleased(session)) {
+    return base;
+  }
+
+  return {
+    ...base,
+    summary: null,
+  };
+}
+
 function sanitizeViolationIds(value) {
   if (!Array.isArray(value)) {
     return [];
@@ -1217,7 +1284,7 @@ function buildStudentDashboardPayload(user, exams, sessions) {
   return {
     user: toPublicUserRecord(user),
     exams: examStats,
-    activeSession: activeSession ? toClientSession(activeSession) : null,
+    activeSession: activeSession ? toStudentClientSession(activeSession) : null,
     trials: trials.slice(0, 40).map(toStudentTrialRow),
   };
 }
@@ -1490,7 +1557,7 @@ app.get('/api/student/trials/:sessionId', requireStudent, async (req, res) => {
     ok: true,
     trial: {
       ...toStudentTrialRow(trial),
-      questionReview: buildQuestionReview(trial),
+      questionReview: buildStudentQuestionReview(trial),
       exam: {
         id: trial.examId ?? 'general',
         title: trial.examTitle ?? 'General Exam Pool',
@@ -1548,7 +1615,7 @@ app.post('/api/exam/start', requireStudent, async (req, res) => {
       attemptsUsed,
       maxAttempts,
       attemptsRemaining,
-      session: toClientSession(activeTrial),
+      session: toStudentClientSession(activeTrial),
     });
     return;
   }
@@ -1607,7 +1674,7 @@ app.post('/api/exam/start', requireStudent, async (req, res) => {
 
   await saveSession(session);
   res.status(201).json({
-    ...toClientSession(session),
+    ...toStudentClientSession(session),
     attemptsUsed: trialNumber,
     maxAttempts,
     attemptsRemaining: Math.max(0, maxAttempts - trialNumber),
@@ -1627,7 +1694,7 @@ app.get('/api/exam/:sessionId', requireStudent, async (req, res) => {
     return;
   }
 
-  res.json(toClientSession(session));
+  res.json(toStudentClientSession(session));
 });
 
 app.post('/api/exam/:sessionId/seen', requireStudent, async (req, res) => {
@@ -1773,8 +1840,8 @@ app.post('/api/exam/:sessionId/submit', requireStudent, async (req, res) => {
 
   res.json({
     ok: true,
-    session: toClientSession(finalized),
-    summary: finalized.summary,
+    session: toStudentClientSession(finalized),
+    summary: isResultsReleased(finalized) ? finalized.summary : null,
   });
 });
 
@@ -1812,7 +1879,7 @@ app.post('/api/exam/:sessionId/feedback', requireStudent, async (req, res) => {
   res.json({
     ok: true,
     feedback: updated.feedback,
-    session: toClientSession(updated),
+    session: toStudentClientSession(updated),
   });
 });
 
