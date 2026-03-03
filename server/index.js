@@ -292,6 +292,58 @@ function sanitizeSelectedOptions(question, selectedOptionIds) {
   return unique;
 }
 
+function normalizeQuestionId(value) {
+  return normalizeName(value).toUpperCase();
+}
+
+function resolveSessionQuestionId(session, requestedQuestionId) {
+  const order = Array.isArray(session?.questionOrder) ? session.questionOrder : [];
+  if (!order.length) {
+    return null;
+  }
+
+  if (order.includes(requestedQuestionId)) {
+    return requestedQuestionId;
+  }
+
+  const normalizedRequested = normalizeQuestionId(requestedQuestionId);
+  if (!normalizedRequested) {
+    return null;
+  }
+
+  for (const questionId of order) {
+    if (normalizeQuestionId(questionId) === normalizedRequested) {
+      return questionId;
+    }
+  }
+
+  return null;
+}
+
+function resolveQuestionFromSnapshot(session, questionId) {
+  const snapshot = session?.questionSnapshot;
+  if (!snapshot || typeof snapshot !== 'object') {
+    return null;
+  }
+
+  if (snapshot[questionId]) {
+    return snapshot[questionId];
+  }
+
+  const normalizedId = normalizeQuestionId(questionId);
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (normalizeQuestionId(key) === normalizedId) {
+      return value;
+    }
+
+    if (normalizeQuestionId(value?.id) === normalizedId) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
 function evaluateSession(session) {
   let correctCount = 0;
   let answeredCount = 0;
@@ -1721,15 +1773,20 @@ app.get('/api/exam/:sessionId', requireStudent, async (req, res) => {
 
 app.post('/api/exam/:sessionId/seen', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
-  const questionId = req.body?.questionId;
+  const requestedQuestionId = req.body?.questionId;
 
   const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
   if (!session) {
     return;
   }
 
-  if (!session.questionOrder.includes(questionId)) {
-    res.status(400).json({ error: 'Question is not in this exam session.' });
+  const questionId = resolveSessionQuestionId(session, requestedQuestionId);
+  if (!questionId) {
+    res.status(400).json({
+      error: 'Question is not in this exam session.',
+      code: 'QUESTION_NOT_IN_SESSION',
+      questionId: requestedQuestionId ?? null,
+    });
     return;
   }
 
@@ -1746,21 +1803,36 @@ app.post('/api/exam/:sessionId/seen', requireStudent, async (req, res) => {
 
 app.post('/api/exam/:sessionId/answer', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
-  const questionId = req.body?.questionId;
+  const requestedQuestionId = req.body?.questionId;
 
   const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
   if (!session) {
     return;
   }
 
-  if (!session.questionOrder.includes(questionId)) {
-    res.status(400).json({ error: 'Question is not in this exam session.' });
+  const questionId = resolveSessionQuestionId(session, requestedQuestionId);
+  if (!questionId) {
+    res.status(400).json({
+      error: 'Question is not in this exam session.',
+      code: 'QUESTION_NOT_IN_SESSION',
+      questionId: requestedQuestionId ?? null,
+    });
     return;
   }
 
-  const question = session.questionSnapshot?.[questionId];
+  let question = resolveQuestionFromSnapshot(session, questionId);
   if (!question) {
-    res.status(400).json({ error: 'Question details could not be loaded for this session.' });
+    const questionMap = await getQuestionByIdMap();
+    const normalizedQuestionId = normalizeQuestionId(questionId);
+    question = questionMap.get(questionId) ?? questionMap.get(normalizedQuestionId) ?? null;
+  }
+
+  if (!question) {
+    res.status(400).json({
+      error: 'Question details could not be loaded for this session.',
+      code: 'QUESTION_DETAILS_MISSING',
+      questionId,
+    });
     return;
   }
 
@@ -1768,6 +1840,10 @@ app.post('/api/exam/:sessionId/answer', requireStudent, async (req, res) => {
 
   const updated = await updateSession(sessionId, (current) => ({
     ...current,
+    questionSnapshot: {
+      ...(current.questionSnapshot ?? {}),
+      [questionId]: resolveQuestionFromSnapshot(current, questionId) ?? question,
+    },
     answers: {
       ...current.answers,
       [questionId]: selected,
@@ -1779,7 +1855,7 @@ app.post('/api/exam/:sessionId/answer', requireStudent, async (req, res) => {
 
 app.post('/api/exam/:sessionId/flag', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
-  const questionId = req.body?.questionId;
+  const requestedQuestionId = req.body?.questionId;
   const flagged = Boolean(req.body?.flagged);
 
   const session = await getUpdatableSessionOrError(sessionId, res, req.student.user);
@@ -1787,8 +1863,13 @@ app.post('/api/exam/:sessionId/flag', requireStudent, async (req, res) => {
     return;
   }
 
-  if (!session.questionOrder.includes(questionId)) {
-    res.status(400).json({ error: 'Question is not in this exam session.' });
+  const questionId = resolveSessionQuestionId(session, requestedQuestionId);
+  if (!questionId) {
+    res.status(400).json({
+      error: 'Question is not in this exam session.',
+      code: 'QUESTION_NOT_IN_SESSION',
+      questionId: requestedQuestionId ?? null,
+    });
     return;
   }
 

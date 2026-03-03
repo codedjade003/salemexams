@@ -453,6 +453,19 @@ function StudentExamApp() {
     setSession((prev) => (prev ? { ...prev, seen: { ...prev.seen, [questionId]: true } } : prev));
 
     void markSeen(authToken, session.sessionId, questionId).catch(async (error) => {
+      if (
+        error?.status === 400 &&
+        ['QUESTION_NOT_IN_SESSION', 'QUESTION_DETAILS_MISSING'].includes(error?.payload?.code)
+      ) {
+        try {
+          const latest = await fetchSession(authToken, session.sessionId);
+          setSession(latest);
+          return;
+        } catch {
+          // fall through to standard error handling
+        }
+      }
+
       if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not save read status.');
       }
@@ -666,6 +679,47 @@ function StudentExamApp() {
     );
 
     void saveAnswer(authToken, session.sessionId, question.id, selected).catch(async (error) => {
+      if (
+        error?.status === 400 &&
+        ['QUESTION_NOT_IN_SESSION', 'QUESTION_DETAILS_MISSING'].includes(error?.payload?.code)
+      ) {
+        try {
+          const latest = await fetchSession(authToken, session.sessionId);
+          const fallbackQuestion = latest?.questions?.[currentIndex] ?? null;
+          if (!fallbackQuestion?.id) {
+            setSession(latest);
+            return;
+          }
+
+          const latestPrevious = latest.responses?.[fallbackQuestion.id] ?? [];
+          const fallbackSelected =
+            fallbackQuestion.type === 'single'
+              ? [optionId]
+              : latestPrevious.includes(optionId)
+                ? latestPrevious.filter((id) => id !== optionId)
+                : [...latestPrevious, optionId];
+
+          const retry = await saveAnswer(
+            authToken,
+            latest.sessionId,
+            fallbackQuestion.id,
+            fallbackSelected
+          );
+
+          setSession({
+            ...latest,
+            responses: retry?.responses ?? {
+              ...(latest.responses ?? {}),
+              [fallbackQuestion.id]: fallbackSelected,
+            },
+          });
+          setInfoMessage('Session synced. Answer saved.');
+          return;
+        } catch {
+          // fall through to standard error handling
+        }
+      }
+
       if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not save answer.');
       }
@@ -711,6 +765,19 @@ function StudentExamApp() {
     );
 
     void saveFlag(authToken, session.sessionId, activeQuestion.id, nextFlagged).catch(async (error) => {
+      if (
+        error?.status === 400 &&
+        ['QUESTION_NOT_IN_SESSION', 'QUESTION_DETAILS_MISSING'].includes(error?.payload?.code)
+      ) {
+        try {
+          const latest = await fetchSession(authToken, session.sessionId);
+          setSession(latest);
+          return;
+        } catch {
+          // fall through to standard error handling
+        }
+      }
+
       if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not update flag status.');
       }

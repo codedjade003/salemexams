@@ -9,6 +9,8 @@
     "dev:server": "node --watch server/index.js",
     "start": "node server/index.js",
     "hash:admin": "node scripts/hash-admin-password.mjs",
+    "audit:sessions": "node scripts/audit-sessions.mjs",
+    "audit:sessions:fix": "node scripts/audit-sessions.mjs --fix --finalize-expired",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"
