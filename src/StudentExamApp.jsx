@@ -17,6 +17,7 @@ import {
   saveStudentGeneralFeedback,
   startSession,
   studentLogin,
+  studentRegister,
   submitExam,
 } from './api';
 
@@ -95,7 +96,15 @@ function StudentExamApp() {
   const [authExpiresAt, setAuthExpiresAt] = useState(0);
   const [dashboard, setDashboard] = useState(null);
 
-  const [loginForm, setLoginForm] = useState({ fullName: '', classRoom: '', email: '', password: '' });
+  const [authMode, setAuthMode] = useState('login');
+  const [loginForm, setLoginForm] = useState({ email: '', password: '' });
+  const [registerForm, setRegisterForm] = useState({
+    fullName: '',
+    classRoom: '',
+    email: '',
+    password: '',
+    confirmPassword: '',
+  });
   const [helpForm, setHelpForm] = useState({ fullName: '', classRoom: '', email: '', message: '' });
   const [changePasswordForm, setChangePasswordForm] = useState({
     currentPassword: '',
@@ -113,6 +122,7 @@ function StudentExamApp() {
   const [infoMessage, setInfoMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [isRegistering, setIsRegistering] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSavingFeedback, setIsSavingFeedback] = useState(false);
@@ -262,10 +272,16 @@ function StudentExamApp() {
           if (next?.user) {
             setLoginForm((prev) => ({
               ...prev,
+              email: next.user.email ?? '',
+              password: '',
+            }));
+            setRegisterForm((prev) => ({
+              ...prev,
               fullName: next.user.fullName ?? '',
               classRoom: next.user.classRoom ?? '',
               email: next.user.email ?? '',
               password: '',
+              confirmPassword: '',
             }));
             setHelpForm((prev) => ({
               ...prev,
@@ -374,6 +390,10 @@ function StudentExamApp() {
     () => dashboard?.exams?.find((exam) => exam.id === selectedExamId) ?? null,
     [dashboard?.exams, selectedExamId]
   );
+  const leaderboardOverall = dashboard?.leaderboards?.overall ?? [];
+  const leaderboardClassTop = dashboard?.leaderboards?.classTop ?? [];
+  const currentLeaderboard = dashboard?.leaderboards?.currentStudent ?? null;
+  const generalFeedbackHistory = dashboard?.generalFeedbackHistory ?? [];
   const resultsLocked = Boolean(session?.submittedAt && session?.resultsReleased === false);
   const resultReleaseInSeconds =
     resultsLocked && session?.resultsAvailableAt
@@ -627,7 +647,10 @@ function StudentExamApp() {
     setIsLoggingIn(true);
 
     try {
-      const payload = await studentLogin(loginForm);
+      const payload = await studentLogin({
+        email: loginForm.email,
+        password: loginForm.password,
+      });
       storeToken(payload.token, payload.expiresAt);
       const nextDashboard = {
         user: payload.user,
@@ -643,9 +666,17 @@ function StudentExamApp() {
       );
       setHelpForm((prev) => ({
         ...prev,
-        fullName: loginForm.fullName,
-        classRoom: loginForm.classRoom,
-        email: loginForm.email,
+        fullName: payload.user?.fullName ?? prev.fullName,
+        classRoom: payload.user?.classRoom ?? prev.classRoom,
+        email: payload.user?.email ?? loginForm.email,
+      }));
+      setRegisterForm((prev) => ({
+        ...prev,
+        fullName: payload.user?.fullName ?? prev.fullName,
+        classRoom: payload.user?.classRoom ?? prev.classRoom,
+        email: payload.user?.email ?? prev.email,
+        password: '',
+        confirmPassword: '',
       }));
       setLoginForm((prev) => ({ ...prev, password: '' }));
       setChangePasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
@@ -663,9 +694,68 @@ function StudentExamApp() {
     }
   };
 
+  const handleRegister = async (event) => {
+    event.preventDefault();
+    if (registerForm.password !== registerForm.confirmPassword) {
+      setErrorMessage('Password and confirmation do not match.');
+      return;
+    }
+
+    setErrorMessage('');
+    setIsRegistering(true);
+
+    try {
+      const payload = await studentRegister({
+        fullName: registerForm.fullName,
+        classRoom: registerForm.classRoom,
+        email: registerForm.email,
+        password: registerForm.password,
+      });
+      storeToken(payload.token, payload.expiresAt);
+
+      const nextDashboard = {
+        user: payload.user,
+        exams: payload.exams ?? [],
+        activeSession: payload.activeSession ?? null,
+        trials: payload.trials ?? [],
+        leaderboards: payload.leaderboards ?? { classRoom: '', overall: [], classTop: [], currentStudent: null },
+        generalFeedbackHistory: payload.generalFeedbackHistory ?? [],
+      };
+
+      setDashboard(nextDashboard);
+      setSelectedExamId(
+        nextDashboard.exams.find((exam) => exam.id === 'general')?.id ?? nextDashboard.exams[0]?.id ?? ''
+      );
+      setHelpForm((prev) => ({
+        ...prev,
+        fullName: payload.user?.fullName ?? registerForm.fullName,
+        classRoom: payload.user?.classRoom ?? registerForm.classRoom,
+        email: payload.user?.email ?? registerForm.email,
+      }));
+      setLoginForm({
+        email: payload.user?.email ?? registerForm.email,
+        password: '',
+      });
+      setRegisterForm((prev) => ({
+        ...prev,
+        password: '',
+        confirmPassword: '',
+      }));
+      setChangePasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setPhase('setup');
+      setAuthMode('login');
+      setInfoMessage('Registration successful. You are now signed in.');
+    } catch (error) {
+      setErrorMessage(error.message || 'Could not register.');
+    } finally {
+      setIsRegistering(false);
+    }
+  };
+
   const handleLogout = () => {
     clearAuth();
     setPhase('setup');
+    setAuthMode('login');
     setTourRunning(false);
     setTourIndex(0);
     setSubmitConfirmArmed(false);
@@ -851,6 +941,7 @@ function StudentExamApp() {
     setCurrentIndex(0);
     setTourRunning(false);
     setTourIndex(0);
+    setAuthMode('login');
     setSubmitConfirmArmed(false);
     setPhase('setup');
     clearStoredSession();
@@ -1058,59 +1149,115 @@ function StudentExamApp() {
         <main className="center-screen">
           <div className="card-panel wide">
             <h1>Salem Academy CBT</h1>
-            <p className="muted">
-              Login with your details. First password is your full name joined in lowercase.
-            </p>
+            <p className="muted">Login with email and password, or register a new student account.</p>
 
-            <form onSubmit={handleLogin} className="form-stack">
-              <label htmlFor="fullName">Full Name</label>
-              <input
-                id="fullName"
-                required
-                minLength={5}
-                value={loginForm.fullName}
-                onChange={(event) => setLoginForm((prev) => ({ ...prev, fullName: event.target.value }))}
-              />
-
-              <label htmlFor="classRoom">Class</label>
-              <select
-                id="classRoom"
-                required
-                value={loginForm.classRoom}
-                onChange={(event) => setLoginForm((prev) => ({ ...prev, classRoom: event.target.value }))}
+            <div className="inline-actions">
+              <button
+                type="button"
+                className={`btn ${authMode === 'login' ? 'btn-primary' : 'btn-outline'}`}
+                onClick={() => setAuthMode('login')}
               >
-                <option value="">Select class</option>
-                {meta?.classOptions?.map((classOption) => (
-                  <option key={classOption} value={classOption}>
-                    {classOption}
-                  </option>
-                ))}
-              </select>
-
-              <label htmlFor="email">Email</label>
-              <input
-                id="email"
-                type="email"
-                required
-                value={loginForm.email}
-                onChange={(event) => setLoginForm((prev) => ({ ...prev, email: event.target.value }))}
-              />
-
-              <label htmlFor="password">Password</label>
-              <input
-                id="password"
-                type="password"
-                required
-                value={loginForm.password}
-                onChange={(event) => setLoginForm((prev) => ({ ...prev, password: event.target.value }))}
-              />
-
-              {errorMessage && <p className="error-text">{errorMessage}</p>}
-
-              <button type="submit" className="btn btn-primary" disabled={isLoggingIn}>
-                {isLoggingIn ? 'Signing In...' : 'Login'}
+                Login
               </button>
-            </form>
+              <button
+                type="button"
+                className={`btn ${authMode === 'register' ? 'btn-primary' : 'btn-outline'}`}
+                onClick={() => setAuthMode('register')}
+              >
+                Register
+              </button>
+            </div>
+
+            {authMode === 'login' ? (
+              <form onSubmit={handleLogin} className="form-stack">
+                <label htmlFor="email">Email</label>
+                <input
+                  id="email"
+                  type="email"
+                  required
+                  value={loginForm.email}
+                  onChange={(event) => setLoginForm((prev) => ({ ...prev, email: event.target.value }))}
+                />
+
+                <label htmlFor="password">Password</label>
+                <input
+                  id="password"
+                  type="password"
+                  required
+                  value={loginForm.password}
+                  onChange={(event) => setLoginForm((prev) => ({ ...prev, password: event.target.value }))}
+                />
+
+                {errorMessage && <p className="error-text">{errorMessage}</p>}
+
+                <button type="submit" className="btn btn-primary" disabled={isLoggingIn}>
+                  {isLoggingIn ? 'Signing In...' : 'Login'}
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleRegister} className="form-stack">
+                <label htmlFor="registerFullName">Full Name</label>
+                <input
+                  id="registerFullName"
+                  required
+                  minLength={5}
+                  value={registerForm.fullName}
+                  onChange={(event) => setRegisterForm((prev) => ({ ...prev, fullName: event.target.value }))}
+                />
+
+                <label htmlFor="registerClassRoom">Class</label>
+                <select
+                  id="registerClassRoom"
+                  required
+                  value={registerForm.classRoom}
+                  onChange={(event) => setRegisterForm((prev) => ({ ...prev, classRoom: event.target.value }))}
+                >
+                  <option value="">Select class</option>
+                  {meta?.classOptions?.map((classOption) => (
+                    <option key={classOption} value={classOption}>
+                      {classOption}
+                    </option>
+                  ))}
+                </select>
+
+                <label htmlFor="registerEmail">Email</label>
+                <input
+                  id="registerEmail"
+                  type="email"
+                  required
+                  value={registerForm.email}
+                  onChange={(event) => setRegisterForm((prev) => ({ ...prev, email: event.target.value }))}
+                />
+
+                <label htmlFor="registerPassword">Password</label>
+                <input
+                  id="registerPassword"
+                  type="password"
+                  required
+                  minLength={4}
+                  value={registerForm.password}
+                  onChange={(event) => setRegisterForm((prev) => ({ ...prev, password: event.target.value }))}
+                />
+
+                <label htmlFor="registerConfirmPassword">Confirm Password</label>
+                <input
+                  id="registerConfirmPassword"
+                  type="password"
+                  required
+                  minLength={4}
+                  value={registerForm.confirmPassword}
+                  onChange={(event) =>
+                    setRegisterForm((prev) => ({ ...prev, confirmPassword: event.target.value }))
+                  }
+                />
+
+                {errorMessage && <p className="error-text">{errorMessage}</p>}
+
+                <button type="submit" className="btn btn-primary" disabled={isRegistering}>
+                  {isRegistering ? 'Creating Account...' : 'Create Account'}
+                </button>
+              </form>
+            )}
 
             <details className="feedback-panel">
               <summary>
@@ -1824,10 +1971,6 @@ function StudentExamApp() {
     : 0;
   const unansweredCount = (session?.questions?.length ?? 0) - answeredCount;
   const violationCount = session?.violations?.length ?? 0;
-  const leaderboardOverall = dashboard?.leaderboards?.overall ?? [];
-  const leaderboardClassTop = dashboard?.leaderboards?.classTop ?? [];
-  const currentLeaderboard = dashboard?.leaderboards?.currentStudent ?? null;
-  const generalFeedbackHistory = dashboard?.generalFeedbackHistory ?? [];
 
   return (
     <main className="exam-shell">

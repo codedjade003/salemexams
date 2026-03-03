@@ -17,8 +17,9 @@ import {
 } from './examStore.js';
 import {
   buildUserKey,
+  createUserWithPassword,
   createPasswordAssistanceRequest,
-  createUserFromDefaultPassword,
+  getUserByEmail,
   getUserById,
   getUserByKey,
   listPasswordAssistanceRequests,
@@ -1815,7 +1816,7 @@ app.get('/api/exam/meta', async (_req, res) => {
   });
 });
 
-app.post('/api/student/login', async (req, res) => {
+app.post('/api/student/register', async (req, res) => {
   const fullName = normalizeName(req.body?.fullName);
   const classRoom = normalizeName(req.body?.classRoom);
   const email = normalizeEmail(req.body?.email);
@@ -1836,23 +1837,69 @@ app.post('/api/student/login', async (req, res) => {
     return;
   }
 
+  if (password.length < 4) {
+    res.status(400).json({ error: 'Password must be at least 4 characters.' });
+    return;
+  }
+
+  let user;
+  try {
+    user = await createUserWithPassword({ fullName, classRoom, email }, password, {
+      mustChangePassword: false,
+    });
+  } catch (error) {
+    if (error?.code === 'EMAIL_ALREADY_EXISTS') {
+      res.status(409).json({ error: 'An account with this email already exists. Please login instead.' });
+      return;
+    }
+
+    if (error?.code === 'USER_ALREADY_EXISTS') {
+      res.status(409).json({ error: 'An account with these details already exists. Please login instead.' });
+      return;
+    }
+
+    res.status(400).json({ error: error.message || 'Could not create student account.' });
+    return;
+  }
+
+  await touchUserLogin(user.id);
+  const refreshedUser = (await getUserById(user.id)) ?? user;
+  const tokenInfo = await issueStudentToken(refreshedUser);
+  const [exams, sessions, generalFeedbackHistory] = await Promise.all([
+    listExams(),
+    getLatestSessions(),
+    listGeneralFeedbackByUser(refreshedUser.id, 8),
+  ]);
+  const dashboard = buildStudentDashboardPayload(refreshedUser, exams, sessions);
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(201).json({
+    ok: true,
+    token: tokenInfo.token,
+    expiresAt: tokenInfo.expiresAt,
+    tokenLifetimeMs: STUDENT_TOKEN_LIFETIME_MS,
+    generalFeedbackHistory,
+    ...dashboard,
+  });
+});
+
+app.post('/api/student/login', async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+  if (!isValidEmail(email)) {
+    res.status(400).json({ error: 'Please enter a valid email address.' });
+    return;
+  }
+
   if (password.length < 3) {
     res.status(400).json({ error: 'Please enter your password.' });
     return;
   }
 
-  const userKey = buildUserKey({ fullName, classRoom, email });
-  let user = await getUserByKey(userKey);
+  const user = await getUserByEmail(email);
   if (!user) {
-    try {
-      user = await createUserFromDefaultPassword({ fullName, classRoom, email });
-    } catch {
-      user = await getUserByKey(userKey);
-    }
-  }
-
-  if (!user) {
-    res.status(500).json({ error: 'Could not create your student account right now.' });
+    res.status(404).json({ error: 'No account found for this email. Please register first.' });
     return;
   }
 

@@ -1,102 +1,110 @@
 # Salem Academy CBT Exam App
 
-Production-ready React + Vite CBT platform with an Express backend and an admin dashboard.
+React + Vite CBT frontend with an Express + MongoDB backend and an admin dashboard.
+
+## Current Auth Flow
+
+- Student registration: full name, class, email, password
+- Student login: email + password only
+- Student token + admin token are persisted in MongoDB (survive server restarts)
 
 ## Features
 
-- Student login with full name and class selection (`JSS1 A` to `SS2 D`)
-- Student email collection for result communication
-- 25-minute fixed exam timer
-- 40 questions served per candidate, randomized from pool
-- One-question-per-screen flow + question palette (Answered, Unanswered, Flagged, Unread)
-- Fullscreen exam mode + browser proctoring violations
-- Server-side scoring with violation penalty
-- Session recovery after refresh
-- Guided student tour
-- Admin dashboard at `/admin`
-- Dashboard analytics (completion, score distribution, class performance, violation trends)
-- Session filters (search, class, status)
-- Export center (sessions/questions in CSV and JSON)
-- Email-only export for local mailing workflows
-- Add-question form for expanding the pool
-
-## Question Pool
-
-The default pool now includes 40 beginner-level questions focused on:
-
-- Computer basics and internet/web basics
-- 10 computer navigation questions (right-click, folder actions, simple shortcuts)
-- 5 VS Code questions (Explorer, open folder, save, new file)
-
-Pool is persisted in `server/data/questions.json` and loaded from `server/questions.js` defaults only on first run.
+- Student dashboard (exam start/resume, previous trials, class + overall leaderboard)
+- General dashboard feedback from students
+- Timed exam sessions with autosubmit
+- Proctoring events + violation penalty model
+- Result page with score summary
+- Review flow:
+  - selected answers shown immediately after submit
+  - correct answers shown after release time
+- Student and admin report card download (HTML export)
+- Admin branding settings (school name + logo URL for report cards)
+- Admin management:
+  - sessions, users, password resets, exams, questions
+  - exports and analytics
 
 ## Tech Stack
 
 - Frontend: React + Vite
 - Backend: Express + Helmet + CORS
-- Storage:
-  - Sessions: `server/data/sessions.json`
-  - Question pool: `server/data/questions.json`
+- Database: MongoDB
+
+## Environment
+
+Use `.env.example` as reference.
+
+Required:
+
+- `MONGO_URI`
+- `MONGO_DB_NAME`
+- `ADMIN_PASSCODE_HASH`
+
+Optional:
+
+- `PORT` (default `4000`)
+- `RESULT_RELEASE_DELAY_MS` (default `1500000`, 25 minutes)
+- `KEEP_ALIVE_ENABLED`, `KEEP_ALIVE_URL`, `KEEP_ALIVE_INTERVAL_MS`
+
+Generate admin hash:
+
+```bash
+npm run hash:admin -- "your-strong-passcode"
+```
 
 ## Run Locally
 
-1. Install dependencies
+Install:
 
 ```bash
 npm install
 ```
 
-2. Start frontend + backend together
+Development:
 
 ```bash
 npm run dev
 ```
 
 - Student app: `http://localhost:5173`
-- Admin dashboard: `http://localhost:5173/admin`
-- Backend API: `http://localhost:4000`
+- Admin app: `http://localhost:5173/admin`
 
-Vite proxies `/api` to backend during development.
-
-## Admin Login
-
-Admin login uses a hashed passcode from environment (`ADMIN_PASSCODE_HASH`).
-
-Generate a hash:
-
-```bash
-npm run hash:admin -- "your-strong-password"
-```
-
-Then add the output to `.env`:
-
-```env
-ADMIN_PASSCODE_HASH=scrypt$16384$8$1$...$...
-```
-
-If `ADMIN_PASSCODE_HASH` is missing, admin login is disabled.
-
-Keep-alive (Render free mode helper):
-
-```env
-KEEP_ALIVE_ENABLED=true
-KEEP_ALIVE_URL=https://your-backend.onrender.com/api/keep-alive
-```
-
-The server has both `GET /api/health` and `GET /api/keep-alive`, and will self-ping every 5 minutes.
-
-## Production Build
+Production-style run:
 
 ```bash
 npm run build
 npm run start
 ```
 
-If `dist` exists, Express serves the frontend and supports SPA routes (including `/admin`).
+## Smoke Test
 
-## API Overview
+End-to-end smoke test (local server + temporary DB):
 
-Student APIs:
+```bash
+npm run test:smoke
+```
+
+The smoke script covers:
+
+- register/login/change-password
+- token persistence after restart
+- exam flow (start, seen, answer, flag, proctor, submit, feedback)
+- student report card endpoint
+- admin login + branding + report card
+- admin password reset flow
+
+## API (Key Endpoints)
+
+Student auth/profile:
+
+- `POST /api/student/register`
+- `POST /api/student/login`
+- `GET /api/student/me`
+- `POST /api/student/change-password`
+- `POST /api/student/password-help`
+- `POST /api/student/feedback` (general dashboard feedback)
+
+Student exam:
 
 - `GET /api/exam/meta`
 - `POST /api/exam/start`
@@ -107,35 +115,24 @@ Student APIs:
 - `POST /api/exam/:sessionId/proctor`
 - `POST /api/exam/:sessionId/submit`
 - `POST /api/exam/:sessionId/feedback`
+- `GET /api/student/trials/:sessionId/report-card`
 
-Admin APIs:
+Admin:
 
 - `POST /api/admin/login`
 - `GET /api/admin/overview`
 - `GET /api/admin/sessions`
 - `GET /api/admin/sessions/:sessionId`
-- `GET /api/admin/questions`
-- `POST /api/admin/questions`
-- `GET /api/admin/export/sessions.csv`
-- `GET /api/admin/export/sessions.json`
-- `GET /api/admin/export/emails.csv`
-- `GET /api/admin/export/questions.csv`
-- `GET /api/admin/export/questions.json`
+- `GET /api/admin/sessions/:sessionId/report-card`
+- `PATCH /api/admin/sessions/:sessionId/violations/waive`
+- `GET /api/admin/settings/branding`
+- `PATCH /api/admin/settings/branding`
+- `GET /api/admin/users`
+- `PATCH /api/admin/users/:userId`
+- `POST /api/admin/users/:userId/password`
 
-## Local Mailer
+## OpenAPI/Swagger Spec
 
-A standalone local mailer lives in `local-mailer/` and is not part of the deployed CBT app.
+- OpenAPI file: [docs/openapi.yaml](docs/openapi.yaml)
 
-```bash
-cd local-mailer
-npm install
-npm run dev
-```
-
-Then open `http://localhost:5050`.
-
-## Notes
-
-- Browser proctoring is best-effort and not equivalent to OS-level lockdown software.
-- Keep `.env` out of source control and never commit admin hashes.
-# salemexams
+If you want Swagger UI wired directly into the app, add a Swagger UI middleware route and serve this spec.

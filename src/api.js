@@ -53,6 +53,13 @@ export function studentLogin(payload) {
   });
 }
 
+export function studentRegister(payload) {
+  return apiRequest('/api/student/register', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export function fetchStudentMe(token) {
   return apiRequest('/api/student/me', {
     headers: withStudentHeaders(token),

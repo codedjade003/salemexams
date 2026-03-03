@@ -91,6 +91,18 @@ export async function getUserByKey(userKey) {
   return found ? stripMongoId(found) : null;
 }
 
+export async function getUserByEmail(email) {
+  await ensureInitialized();
+  const users = await getCollection(USERS_COLLECTION);
+  const normalized = normalizeEmail(email);
+  if (!normalized) {
+    return null;
+  }
+
+  const found = await users.findOne({ email: normalized });
+  return found ? stripMongoId(found) : null;
+}
+
 export async function listUsers() {
   await ensureInitialized();
   const users = await getCollection(USERS_COLLECTION);
@@ -98,15 +110,32 @@ export async function listUsers() {
   return rows.map((row) => stripMongoId(row));
 }
 
-export async function createUserFromDefaultPassword(payload) {
+export async function createUserWithPassword(payload, password, options = {}) {
   await ensureInitialized();
   const users = await getCollection(USERS_COLLECTION);
   const normalized = sanitizeUserInput(payload);
   const userKey = buildUserKey(normalized);
-  const defaultPassword = defaultPasswordFromName(normalized.fullName);
 
-  if (!normalized.fullName || !normalized.classRoom || !normalized.email || !defaultPassword) {
+  if (!normalized.fullName || !normalized.classRoom || !normalized.email) {
     throw new Error('Invalid student details.');
+  }
+
+  if (typeof password !== 'string' || password.length < 4) {
+    throw new Error('Password must be at least 4 characters.');
+  }
+
+  const existingEmail = await users.findOne({ email: normalized.email });
+  if (existingEmail) {
+    const error = new Error('A student account with this email already exists.');
+    error.code = 'EMAIL_ALREADY_EXISTS';
+    throw error;
+  }
+
+  const existingUserKey = await users.findOne({ userKey });
+  if (existingUserKey) {
+    const error = new Error('A student account with these details already exists.');
+    error.code = 'USER_ALREADY_EXISTS';
+    throw error;
   }
 
   const now = Date.now();
@@ -116,17 +145,26 @@ export async function createUserFromDefaultPassword(payload) {
     fullName: normalized.fullName,
     classRoom: normalized.classRoom,
     email: normalized.email,
-    passwordHash: hashPasswordScrypt(defaultPassword),
-    mustChangePassword: true,
+    passwordHash: hashPasswordScrypt(password),
+    mustChangePassword: Boolean(options.mustChangePassword),
     disabled: false,
     createdAt: now,
     updatedAt: now,
     lastLoginAt: null,
-    passwordUpdatedAt: null,
+    passwordUpdatedAt: options.mustChangePassword ? null : now,
   };
 
   await users.insertOne(user);
   return stripMongoId(user);
+}
+
+export async function createUserFromDefaultPassword(payload) {
+  const normalized = sanitizeUserInput(payload);
+  const defaultPassword = defaultPasswordFromName(normalized.fullName);
+  if (!defaultPassword) {
+    throw new Error('Invalid student details.');
+  }
+  return createUserWithPassword(normalized, defaultPassword, { mustChangePassword: true });
 }
 
 export async function touchUserLogin(userId) {

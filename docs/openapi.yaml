@@ -1,0 +1,193 @@
+openapi: 3.0.3
+info:
+  title: Salem Exams API
+  version: 1.0.0
+  description: Core API surface for student auth/exam flow and admin controls.
+servers:
+  - url: http://localhost:4000
+paths:
+  /api/student/register:
+    post:
+      summary: Register student
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fullName, classRoom, email, password]
+              properties:
+                fullName: { type: string }
+                classRoom: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 4 }
+      responses:
+        '201':
+          description: Registered and logged in
+        '409':
+          description: Email/details already exist
+
+  /api/student/login:
+    post:
+      summary: Student login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Login success
+        '401':
+          description: Invalid password
+        '404':
+          description: Account not found
+
+  /api/student/me:
+    get:
+      summary: Student dashboard payload
+      security:
+        - studentBearer: []
+      responses:
+        '200':
+          description: Dashboard payload
+
+  /api/student/change-password:
+    post:
+      summary: Change student password
+      security:
+        - studentBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string }
+                newPassword: { type: string, minLength: 4 }
+      responses:
+        '200':
+          description: Password changed
+
+  /api/student/feedback:
+    post:
+      summary: Submit general dashboard feedback
+      security:
+        - studentBearer: []
+      responses:
+        '201':
+          description: Feedback saved
+
+  /api/exam/start:
+    post:
+      summary: Start exam session
+      security:
+        - studentBearer: []
+      responses:
+        '200':
+          description: Session payload
+
+  /api/exam/{sessionId}/submit:
+    post:
+      summary: Submit exam
+      security:
+        - studentBearer: []
+      parameters:
+        - in: path
+          name: sessionId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Submitted session
+
+  /api/student/trials/{sessionId}/report-card:
+    get:
+      summary: Download student report card
+      security:
+        - studentBearer: []
+      parameters:
+        - in: path
+          name: sessionId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: HTML report card
+          content:
+            text/html: {}
+
+  /api/admin/login:
+    post:
+      summary: Admin login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [passcode]
+              properties:
+                passcode: { type: string }
+      responses:
+        '200':
+          description: Admin token
+
+  /api/admin/settings/branding:
+    get:
+      summary: Get branding settings
+      security:
+        - adminBearer: []
+      responses:
+        '200':
+          description: Branding payload
+    patch:
+      summary: Update branding settings
+      security:
+        - adminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                schoolName: { type: string }
+                logoUrl: { type: string }
+      responses:
+        '200':
+          description: Branding saved
+
+  /api/admin/sessions/{sessionId}/report-card:
+    get:
+      summary: Download admin report card
+      security:
+        - adminBearer: []
+      parameters:
+        - in: path
+          name: sessionId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: HTML report card
+          content:
+            text/html: {}
+
+components:
+  securitySchemes:
+    studentBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: UUID
+    adminBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: UUID

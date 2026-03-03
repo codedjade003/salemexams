@@ -919,12 +919,27 @@ body {
   padding-left: 1.05rem;
   display: grid;
   gap: 0.35rem;
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 0.25rem;
 }
 
 .leaderboard-card li {
   display: flex;
   justify-content: space-between;
   gap: 0.4rem;
+  min-width: 0;
+  align-items: baseline;
+}
+
+.leaderboard-card li .truncate-line {
+  flex: 1;
+  min-width: 0;
+}
+
+.leaderboard-card li strong {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .modal-backdrop {

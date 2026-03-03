@@ -36,14 +36,6 @@ function loadEnvFile() {
   }
 }
 
-function defaultPasswordFromName(fullName) {
-  return String(fullName)
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .replace(/[^a-z0-9]/g, '');
-}
-
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
@@ -375,11 +367,18 @@ async function main() {
     const fullName = `Smoke Student ${timestamp}`;
     const classRoom = 'JSS1 A';
     const email = `smoke.${timestamp}@example.com`;
-    const password = defaultPasswordFromName(fullName);
+    const password = `Sm0ke!${timestamp}`;
+
+    const registerPayload = await requestJson(baseUrl, '/api/student/register', {
+      method: 'POST',
+      json: { fullName, classRoom, email, password },
+    });
+    assert(typeof registerPayload.token === 'string' && registerPayload.token.length > 10, 'Register token missing.');
+    printStep('Student registration passed');
 
     const loginPayload = await requestJson(baseUrl, '/api/student/login', {
       method: 'POST',
-      json: { fullName, classRoom, email, password },
+      json: { email, password },
     });
     assert(typeof loginPayload.token === 'string' && loginPayload.token.length > 10, 'Login token missing.');
     printStep('Student login passed');
@@ -402,13 +401,13 @@ async function main() {
       'invalid password',
       {
         method: 'POST',
-        json: { fullName, classRoom, email, password },
+        json: { email, password },
       }
     );
 
     const reloginPayload = await requestJson(baseUrl, '/api/student/login', {
       method: 'POST',
-      json: { fullName, classRoom, email, password: newPassword },
+      json: { email, password: newPassword },
     });
     assert(
       typeof reloginPayload.token === 'string' && reloginPayload.token.length > 10,
@@ -614,13 +613,13 @@ async function main() {
       'invalid password',
       {
         method: 'POST',
-        json: { fullName, classRoom, email, password: newPassword },
+        json: { email, password: newPassword },
       }
     );
 
     const postResetLogin = await requestJson(baseUrl, '/api/student/login', {
       method: 'POST',
-      json: { fullName, classRoom, email, password: adminResetPassword },
+      json: { email, password: adminResetPassword },
     });
     assert(postResetLogin?.user?.mustChangePassword === true, 'Post-reset login should require password change.');
     printStep('Admin password reset flow passed');
