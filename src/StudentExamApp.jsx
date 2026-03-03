@@ -180,6 +180,21 @@ function StudentExamApp() {
     return nextDashboard;
   }, []);
 
+  const refreshDashboardSafely = useCallback(
+    async (token, fallbackMessage = 'Could not refresh dashboard.') => {
+      if (!token) return null;
+      try {
+        return await refreshDashboard(token);
+      } catch (error) {
+        if (!handleUnauthorized(error)) {
+          setErrorMessage(error.message || fallbackMessage);
+        }
+        return null;
+      }
+    },
+    [handleUnauthorized, refreshDashboard]
+  );
+
   const applyServerSession = useCallback(
     async (serverSession) => {
       if (!serverSession) return;
@@ -419,7 +434,7 @@ function StudentExamApp() {
         setSession(payload.session);
         setPhase('result');
         clearStoredSession();
-        void refreshDashboard(authToken);
+        void refreshDashboardSafely(authToken);
         if (document.fullscreenElement) {
           await document.exitFullscreen().catch(() => undefined);
         }
@@ -437,7 +452,7 @@ function StudentExamApp() {
       clearStoredSession,
       handleUnauthorized,
       isSubmitting,
-      refreshDashboard,
+      refreshDashboardSafely,
       session,
     ]
   );
@@ -644,7 +659,7 @@ function StudentExamApp() {
       if (!(await adoptSessionFromError(error)) && !handleUnauthorized(error)) {
         setErrorMessage(error.message || 'Could not start exam session.');
       }
-      void refreshDashboard(authToken);
+      void refreshDashboardSafely(authToken);
     } finally {
       setIsStarting(false);
     }
@@ -1121,7 +1136,11 @@ function StudentExamApp() {
                 </button>
               )}
 
-              <button type="button" className="btn btn-outline" onClick={() => void refreshDashboard(authToken)}>
+              <button
+                type="button"
+                className="btn btn-outline"
+                onClick={() => void refreshDashboardSafely(authToken)}
+              >
                 Refresh Dashboard
               </button>
             </div>

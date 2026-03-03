@@ -1,12 +1,15 @@
 const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 
 async function apiRequest(path, options = {}) {
+  const hasBody = options.body !== undefined && options.body !== null;
+  const headers = new Headers(options.headers ?? {});
+  if (hasBody && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+
   const response = await fetch(`${API_BASE}${path}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers ?? {}),
-    },
     ...options,
+    headers,
   });
 
   const contentType = response.headers.get('content-type') ?? '';

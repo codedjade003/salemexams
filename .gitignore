@@ -14,7 +14,6 @@ dist-ssr
 .env
 .env.*
 !.env.example
-scripts
 
 # Editor directories and files
 .vscode/*
