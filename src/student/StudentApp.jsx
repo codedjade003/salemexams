@@ -775,11 +775,8 @@ function StudentApp() {
     if (!target) return undefined;
 
     target.setAttribute('data-tour-active', 'true');
-    target.scrollIntoView({
-      behavior: 'smooth',
-      block: step.dock === 'top' ? 'end' : 'center',
-      inline: 'nearest',
-    });
+    // Bring the highlighted part into view without jumping the page around.
+    target.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
 
     return () => target.removeAttribute('data-tour-active');
   }, [phase, tourIndex, tourRunning]);

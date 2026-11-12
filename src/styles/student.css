@@ -1144,32 +1144,28 @@
   }
 }
 
-/* Guided tour (first exam only) */
-.tour-overlay {
+/* Guided tour (first exam only).
+   Three layers: the dim (50), the highlighted part of the exam (55), and the tip card (60),
+   which is its own fixed element so nothing highlighted can ever cover it. */
+.tour-dim {
   position: fixed;
   inset: 0;
   z-index: 50;
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  padding: 1.25rem;
   background: rgba(10, 28, 32, 0.45);
-  pointer-events: none;
-}
-
-.tour-overlay.dock-top {
-  align-items: flex-start;
-  padding-top: 5.5rem;
 }
 
 .tour-card {
-  width: min(420px, 100%);
+  position: fixed;
+  z-index: 60;
+  left: 50%;
+  bottom: 1.25rem;
+  transform: translateX(-50%);
+  width: min(440px, calc(100vw - 2rem));
   padding: 1.25rem;
   border-radius: var(--radius-lg);
+  border: 2px solid var(--gold-500);
   background: var(--surface);
   box-shadow: var(--shadow-lg);
-  pointer-events: auto;
-  animation: rise-in 180ms var(--ease);
 }
 
 .tour-card .tour-step {

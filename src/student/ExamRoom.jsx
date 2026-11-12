@@ -390,7 +390,8 @@ export default function ExamRoom({
       ) : null}
 
       {tourRunning && tourStep && !needsResume ? (
-        <div className={`tour-overlay ${tourStep.dock === 'top' ? 'dock-top' : 'dock-bottom'}`}>
+        <>
+          <div className="tour-dim" aria-hidden="true" />
           <div className="tour-card" role="dialog" aria-label="Exam tips">
             <div className="row-between">
               <span className="tour-step">
@@ -433,7 +434,7 @@ export default function ExamRoom({
               </div>
             </div>
           </div>
-        </div>
+        </>
       ) : null}
     </main>
   );
