@@ -212,6 +212,8 @@ export function validateQuestion(question, generatedId = '') {
     codeLanguage: question.codeLanguage === 'text' ? 'text' : 'python',
     codeSampleInput: normalizeCode(question.codeSampleInput ?? '', 500),
     sourceExamId: normalizeExamId(question.sourceExamId) || 'general',
+    // Optional: questions with a higher number are shown after those with a lower one.
+    sectionOrder: Math.min(9, Math.max(0, Math.round(Number(question.sectionOrder) || 0))),
   };
 
   if (type === 'single' || type === 'multi') return { ...base, ...validateChoice(question, type) };
@@ -265,10 +267,11 @@ export function prepareQuestionForSession(question) {
 
 /** Display order of question kinds within an attempt: quick questions first, coding last. */
 export function sectionRank(question) {
-  if (question.type === 'order') return 1;
-  if (question.type === 'flowchart') return 2;
-  if (question.type === 'code') return 4;
-  return question.code && question.codeLanguage !== 'text' ? 3 : 0;
+  const section = (Number(question.sectionOrder) || 0) * 10;
+  if (question.type === 'order') return section + 1;
+  if (question.type === 'flowchart') return section + 2;
+  if (question.type === 'code') return section + 4;
+  return section + (question.code && question.codeLanguage !== 'text' ? 3 : 0);
 }
 
 function maskFlowNodes(nodes, reveal, counter = { slot: 0 }) {

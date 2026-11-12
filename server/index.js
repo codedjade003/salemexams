@@ -67,6 +67,13 @@ import { clientIp, createRateLimiter } from './rateLimit.js';
 import { renderBulkReportCardsHtml, renderReportCardHtml, renderResultSheetHtml } from './reportCard.js';
 import { CURRENT_EXAM, CURRENT_EXAM_ID, CURRENT_EXAM_QUESTIONS, CURRENT_EXAM_SEED_KEY } from './currentExam.js';
 import {
+  SCRATCH_EXAM,
+  SCRATCH_EXAM_CLASSES,
+  SCRATCH_EXAM_ID,
+  SCRATCH_EXAM_QUESTIONS,
+  SCRATCH_EXAM_SEED_KEY,
+} from './scratchExam.js';
+import {
   deleteAdminToken,
   getAdminToken,
   saveAdminToken,
@@ -4530,6 +4537,51 @@ async function ensureCurrentExamSeeded() {
   );
 }
 
+/**
+ * One-time: adds the JSS1 Scratch exam and takes the JSS1 classes off the Algorithms & Python
+ * exam (JSS1 sits Scratch instead). Recorded in settings so admin edits are never overwritten.
+ */
+async function ensureScratchExamSeeded() {
+  const settings = (await getDb()).collection('settings');
+  if (await settings.findOne({ key: SCRATCH_EXAM_SEED_KEY })) {
+    return;
+  }
+
+  if (!(await getExam(SCRATCH_EXAM_ID))) {
+    const exam = await createExam({
+      ...SCRATCH_EXAM,
+      mode: 'pool',
+      questionCount: SCRATCH_EXAM_QUESTIONS.length,
+      allowedClasses: SCRATCH_EXAM_CLASSES,
+    });
+    const created = [];
+    for (const question of SCRATCH_EXAM_QUESTIONS) {
+      created.push(await addQuestion({ ...question, sourceExamId: exam.id }));
+    }
+    await updateExam(exam.id, {
+      mode: 'fixed',
+      questionIds: created.map((question) => question.id),
+      questionCount: created.length,
+    });
+    console.log(`Seeded exam "${SCRATCH_EXAM.title}" with ${created.length} questions.`);
+  }
+
+  const algorithms = await getExam(CURRENT_EXAM_ID);
+  if (algorithms) {
+    const withoutJss1 = (list) => (list ?? []).filter((classRoom) => !SCRATCH_EXAM_CLASSES.includes(classRoom));
+    await updateExam(CURRENT_EXAM_ID, {
+      allowedClasses: withoutJss1(algorithms.allowedClasses),
+      hintClasses: withoutJss1(algorithms.hintClasses),
+    });
+  }
+
+  await settings.updateOne(
+    { key: SCRATCH_EXAM_SEED_KEY },
+    { $set: { key: SCRATCH_EXAM_SEED_KEY, value: { seededAt: Date.now() }, updatedAt: Date.now() } },
+    { upsert: true }
+  );
+}
+
 async function startServer() {
   if (!String(process.env.MONGO_URI ?? '').trim()) {
     console.error('MONGO_URI is not set. Copy .env.example to .env and fill it in.');
@@ -4542,6 +4594,7 @@ async function startServer() {
     // Build indexes before accepting traffic so the first exam rush doesn't pay for it.
     await Promise.all([initSessionStore(), initUserStore(), listExams(), getQuestionPoolCount()]);
     await ensureCurrentExamSeeded();
+    await ensureScratchExamSeeded();
   } catch (error) {
     console.error(`Could not connect to MongoDB: ${error?.message ?? error}`);
     process.exit(1);
