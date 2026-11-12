@@ -7,15 +7,32 @@ async function apiRequest(path, options = {}) {
     headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-  });
+  // Exam saves pass `timeoutMs` so a request that hangs on bad Wi-Fi is abandoned and retried
+  // instead of blocking every save behind it.
+  const { timeoutMs, ...fetchOptions } = options;
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...fetchOptions,
+      headers,
+      signal: controller?.signal,
+    });
+  } catch {
+    clearTimeout(timer);
+    const error = new Error("Can't reach the exam server. Check your connection and try again.");
+    error.status = 0;
+    error.isNetworkError = true;
+    throw error;
+  }
+
+  clearTimeout(timer);
   const contentType = response.headers.get('content-type') ?? '';
   const payload = contentType.includes('application/json')
-    ? await response.json()
-    : { error: 'Unexpected server response.' };
+    ? await response.json().catch(() => ({ error: 'Unexpected server response.' }))
+    : { error: response.status >= 500 ? 'The server had a problem. Please try again.' : 'Unexpected server response.' };
 
   if (!response.ok) {
     const message = payload?.error || `Request failed with status ${response.status}`;
@@ -171,19 +188,54 @@ export function saveFlag(token, sessionId, questionId, flagged, questionIndex = 
   });
 }
 
-export function logViolation(token, sessionId, type, detail) {
+export function logViolation(token, sessionId, type, detail, evidence = {}) {
   return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/proctor`, {
     method: 'POST',
     headers: withStudentHeaders(token),
-    body: JSON.stringify({ type, detail }),
+    body: JSON.stringify({ type, detail, evidence }),
+    timeoutMs: 15_000,
   });
 }
 
-export function submitExam(token, sessionId) {
+/** Spends a hint on a question (free if that question's hint is already revealed). */
+export function requestHint(token, sessionId, questionId) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/hint`, {
+    method: 'POST',
+    headers: withStudentHeaders(token),
+    body: JSON.stringify({ questionId }),
+    timeoutMs: 15_000,
+  });
+}
+
+/** Saves several answers at once: { questionId: answer }. */
+export function saveAnswersBatch(token, sessionId, answers) {
+  return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/answers`, {
+    method: 'POST',
+    headers: withStudentHeaders(token),
+    body: JSON.stringify({ answers }),
+    timeoutMs: 15_000,
+  });
+}
+
+/** Submits the exam, carrying any answers the server has not confirmed yet. */
+export function submitExam(token, sessionId, answers = {}) {
   return apiRequest(`/api/exam/${encodeURIComponent(sessionId)}/submit`, {
     method: 'POST',
     headers: withStudentHeaders(token),
+    body: JSON.stringify({ answers }),
+    timeoutMs: 20_000,
   });
+}
+
+export function disputeViolation(token, sessionId, violationId, payload) {
+  return apiRequest(
+    `/api/student/trials/${encodeURIComponent(sessionId)}/violations/${encodeURIComponent(violationId)}/dispute`,
+    {
+      method: 'POST',
+      headers: withStudentHeaders(token),
+      body: JSON.stringify(payload),
+    }
+  );
 }
 
 export function saveExamFeedback(token, sessionId, payload) {
@@ -505,6 +557,96 @@ export async function downloadAdminExport(token, path, downloadName) {
     }
 
     throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = objectUrl;
+  anchor.download = downloadName;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
+// Server-side sign-out: revokes the token so it can't be reused on a shared lab computer.
+// Best effort — the client clears its own copy regardless of the outcome.
+export function studentLogout(token) {
+  return apiRequest('/api/student/logout', {
+    method: 'POST',
+    headers: withStudentHeaders(token),
+  });
+}
+
+export function adminLogout(token) {
+  return apiRequest('/api/admin/logout', {
+    method: 'POST',
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function updateAdminQuestion(token, questionId, payload) {
+  return apiRequest(`/api/admin/questions/${encodeURIComponent(questionId)}`, {
+    method: 'PATCH',
+    headers: withAdminHeaders(token),
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteAdminQuestion(token, questionId) {
+  return apiRequest(`/api/admin/questions/${encodeURIComponent(questionId)}`, {
+    method: 'DELETE',
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function deleteAdminExam(token, examId) {
+  return apiRequest(`/api/admin/exams/${encodeURIComponent(examId)}`, {
+    method: 'DELETE',
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function fetchAdminDisputes(token, status = 'open') {
+  return apiRequest(`/api/admin/disputes?status=${encodeURIComponent(status)}`, {
+    headers: withAdminHeaders(token),
+  });
+}
+
+export function resolveAdminDispute(token, sessionId, violationId, payload) {
+  return apiRequest(
+    `/api/admin/sessions/${encodeURIComponent(sessionId)}/violations/${encodeURIComponent(violationId)}/dispute`,
+    {
+      method: 'PATCH',
+      headers: withAdminHeaders(token),
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+/** Overrides the automatic mark for one question; `correct: null` restores it. */
+export function setAdminGrade(token, sessionId, questionId, correct) {
+  return apiRequest(`/api/admin/sessions/${encodeURIComponent(sessionId)}/grades`, {
+    method: 'PATCH',
+    headers: withAdminHeaders(token),
+    body: JSON.stringify({ questionId, correct }),
+  });
+}
+
+/** Downloads a printable HTML document produced by a POST endpoint (bulk report cards, result sheet). */
+export async function downloadAdminPrintout(token, path, body, downloadName) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: withAdminHeaders(token, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    const error = new Error(payload?.error || `Request failed with status ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
 
   const blob = await response.blob();

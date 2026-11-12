@@ -1,0 +1,78 @@
+/*
+ * Salem Academy design tokens.
+ * Brand teal comes from the original app (#006666 / #007d7c); gold is a restrained accent.
+ * Every text/background pairing below meets WCAG AA (4.5:1) unless noted.
+ */
+:root {
+  color-scheme: light;
+
+  --font-sans: 'Inter Variable', 'Segoe UI', system-ui, -apple-system, Roboto, Arial, sans-serif;
+  --font-serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* Brand */
+  --brand-950: #022b2b;
+  --brand-900: #033c3c;
+  --brand-800: #034f4f;
+  --brand-700: #006666;
+  --brand-600: #007d7c;
+  --brand-300: #8fcfca;
+  --brand-200: #bfe3e0;
+  --brand-100: #dcefed;
+  --brand-50: #eef7f6;
+
+  --gold-500: #c39a3b;
+  --gold-300: #e3c77f;
+  --gold-100: #f8eed3;
+  --gold-700: #7a5c12;
+
+  /* Neutrals (slightly teal-tinted, as in the original palette) */
+  --ink-900: #102027;
+  --ink-800: #1f3640;
+  --ink-700: #2d4854;
+  --ink-600: #4f6974;
+  --ink-500: #5b7580;
+  --ink-400: #8ba0a8;
+  --ink-300: #b7c6cb;
+
+  --canvas: #f2f6f6;
+  --surface: #ffffff;
+  --surface-2: #f6f9f9;
+  --surface-3: #edf2f3;
+  --line: #dfe7e9;
+  --line-strong: #c8d5d8;
+
+  /* Status: always paired with an icon or label, never color alone */
+  --success-700: #1b7a43;
+  --success-500: #2f9e5b;
+  --success-50: #e7f5ec;
+  --warning-700: #9a5b00;
+  --warning-500: #e8a317;
+  --warning-50: #fdf3e0;
+  --danger-700: #b42318;
+  --danger-600: #c8372d;
+  --danger-50: #fdecea;
+
+  /* Charts: single-series bars. Validated (lightness, chroma, 3:1 vs surface). */
+  --chart-1: #00918a;
+  --chart-1-hover: #00a39b;
+  --chart-grid: #e3eaeb;
+  --chart-axis: #c8d5d8;
+
+  /* Shape & depth */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-full: 999px;
+
+  --shadow-xs: 0 1px 2px rgba(16, 32, 39, 0.05);
+  --shadow-sm: 0 1px 2px rgba(16, 32, 39, 0.06), 0 1px 3px rgba(16, 32, 39, 0.05);
+  --shadow: 0 1px 3px rgba(16, 32, 39, 0.06), 0 8px 24px rgba(16, 32, 39, 0.06);
+  --shadow-lg: 0 24px 48px rgba(16, 32, 39, 0.16), 0 4px 12px rgba(16, 32, 39, 0.06);
+  --focus-ring: 0 0 0 3px rgba(0, 125, 124, 0.3);
+
+  --topbar-height: 64px;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}

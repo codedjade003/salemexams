@@ -1,4 +1,7 @@
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, scrypt as scryptCallback, scryptSync, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
+
+const scryptAsync = promisify(scryptCallback);
 
 const DEFAULT_SCRYPT_N = 16384;
 const DEFAULT_SCRYPT_R = 8;
@@ -82,6 +85,36 @@ export function verifyPasswordScrypt(password, hashValue) {
       p: parsed.p,
     });
 
+    return timingSafeEqual(derived, parsed.digest);
+  } catch {
+    return false;
+  }
+}
+
+// Async variants run on libuv's thread pool, so a burst of logins (a whole class signing in at
+// once) does not block the event loop and stall in-progress exams. Use these in request handlers.
+export async function hashPasswordScryptAsync(password) {
+  const salt = randomBytes(16);
+  const digest = await scryptAsync(String(password), salt, 64, {
+    N: DEFAULT_SCRYPT_N,
+    r: DEFAULT_SCRYPT_R,
+    p: DEFAULT_SCRYPT_P,
+  });
+  return ['scrypt', DEFAULT_SCRYPT_N, DEFAULT_SCRYPT_R, DEFAULT_SCRYPT_P, salt.toString('hex'), digest.toString('hex')].join('$');
+}
+
+export async function verifyPasswordScryptAsync(password, hashValue) {
+  const parsed = parseScryptHash(hashValue);
+  if (!parsed || typeof password !== 'string') {
+    return false;
+  }
+
+  try {
+    const derived = await scryptAsync(password, parsed.salt, parsed.digest.length, {
+      N: parsed.n,
+      r: parsed.r,
+      p: parsed.p,
+    });
     return timingSafeEqual(derived, parsed.digest);
   } catch {
     return false;

@@ -12,7 +12,7 @@ let initialized = false;
 let initializingPromise = null;
 
 function clone(value) {
-  return JSON.parse(JSON.stringify(value));
+  return structuredClone(value);
 }
 
 function normalizeText(value) {
@@ -81,6 +81,12 @@ function sanitizeAllowedClasses(value, fallback = CLASS_OPTIONS) {
   return classes.length ? classes : [...CLASS_OPTIONS];
 }
 
+function sanitizeHintClasses(value) {
+  return [...new Set((Array.isArray(value) ? value : []).map((item) => normalizeText(item)))].filter((classRoom) =>
+    CLASS_OPTIONS.includes(classRoom)
+  );
+}
+
 function sanitizeQuestionIds(value) {
   if (!Array.isArray(value)) {
     return [];
@@ -139,6 +145,12 @@ function normalizeExamRecord(input, { fallbackId = '', fallbackCreatedAt = Date.
     maxAttempts: sanitizePositiveInteger(input?.maxAttempts, DEFAULT_MAX_ATTEMPTS, 1, 50),
     allowedClasses: sanitizeAllowedClasses(input?.allowedClasses),
     published: sanitizeBoolean(input?.published, true),
+    // Archived exams stay available as optional practice but are shown apart from current exams.
+    archived: sanitizeBoolean(input?.archived, false),
+    // Hints: how many each student may use, and which classes get them (none by default).
+    hintsAllowed: sanitizePositiveInteger(input?.hintsAllowed, 0, 0, 20),
+    hintClasses: sanitizeHintClasses(input?.hintClasses),
+    hintNote: normalizeText(input?.hintNote ?? '').slice(0, 300),
     proctoring: {
       tab_switch: sanitizeBoolean(input?.proctoring?.tab_switch, true),
       window_blur: sanitizeBoolean(input?.proctoring?.window_blur, true),
@@ -179,6 +191,7 @@ function defaultGeneralExam() {
     maxAttempts: DEFAULT_MAX_ATTEMPTS,
     allowedClasses: [...CLASS_OPTIONS],
     published: true,
+    archived: false,
     proctoring: {
       tab_switch: true,
       window_blur: true,
@@ -199,16 +212,10 @@ function defaultGeneralExam() {
 
 function sortExamRecords(exams) {
   const copy = [...exams];
-  copy.sort((left, right) => {
-    if (left.id === 'general') {
-      return -1;
-    }
-    if (right.id === 'general') {
-      return 1;
-    }
-
-    return left.title.localeCompare(right.title);
-  });
+  // Current exams first, archived practice exams last; alphabetical within each group.
+  copy.sort(
+    (left, right) => Number(Boolean(left.archived)) - Number(Boolean(right.archived)) || left.title.localeCompare(right.title)
+  );
 
   return copy;
 }
@@ -266,11 +273,40 @@ function buildUniqueExamId(existingExams, preferredId) {
   return `${base}-${suffix}`;
 }
 
+// Exams change only through the admin dashboard, but are read on almost every request.
+// Cache them briefly; every write in this module invalidates the cache immediately.
+const EXAM_CACHE_TTL_MS = 15_000;
+let examCache = null;
+let examCacheLoad = null;
+
+function invalidateExamCache() {
+  examCache = null;
+  examCacheLoad = null;
+}
+
+async function loadExamRows() {
+  if (examCache && examCache.expiresAt > Date.now()) {
+    return examCache.rows;
+  }
+
+  if (!examCacheLoad) {
+    examCacheLoad = (async () => {
+      const collection = await getCollection(COLLECTION_NAME);
+      const exams = await collection.find({}).toArray();
+      const rows = sortExamRecords(exams.map((exam) => stripMongoId(exam)));
+      examCache = { rows, expiresAt: Date.now() + EXAM_CACHE_TTL_MS };
+      return rows;
+    })().finally(() => {
+      examCacheLoad = null;
+    });
+  }
+
+  return examCacheLoad;
+}
+
 export async function listExams() {
   await ensureInitialized();
-  const collection = await getCollection(COLLECTION_NAME);
-  const exams = await collection.find({}).toArray();
-  return sortExamRecords(exams.map((exam) => clone(stripMongoId(exam))));
+  return clone(await loadExamRows());
 }
 
 export async function getExam(examId) {
@@ -280,9 +316,8 @@ export async function getExam(examId) {
     return null;
   }
 
-  const collection = await getCollection(COLLECTION_NAME);
-  const exam = await collection.findOne({ id });
-  return exam ? clone(stripMongoId(exam)) : null;
+  const exam = (await loadExamRows()).find((row) => row.id === id);
+  return exam ? clone(exam) : null;
 }
 
 export async function createExam(payload) {
@@ -302,7 +337,8 @@ export async function createExam(payload) {
     { fallbackId: id }
   );
 
-  await collection.insertOne(next);
+  await collection.insertOne({ ...next });
+  invalidateExamCache();
   return clone(next);
 }
 
@@ -334,6 +370,7 @@ export async function updateExam(examId, patch) {
   );
 
   await collection.replaceOne({ id }, merged, { upsert: false });
+  invalidateExamCache();
   return clone(merged);
 }
 
@@ -369,7 +406,68 @@ export async function attachExamQuestionIds(examId, questionIds) {
   );
 
   await collection.replaceOne({ id }, next, { upsert: false });
+  invalidateExamCache();
   return clone(next);
+}
+
+/**
+ * Returns the fixed-mode exams that would be left with no questions if `questionId` were removed.
+ */
+export async function findExamsOnlyUsingQuestion(questionId) {
+  await ensureInitialized();
+  const target = normalizeText(questionId).toUpperCase();
+  const rows = await loadExamRows();
+  return clone(
+    rows.filter(
+      (exam) =>
+        exam.mode === 'fixed' &&
+        (exam.questionIds ?? []).includes(target) &&
+        (exam.questionIds ?? []).every((id) => id === target)
+    )
+  );
+}
+
+/**
+ * Removes a question from every fixed-mode exam that lists it. Call `findExamsOnlyUsingQuestion`
+ * first: an exam cannot be left empty.
+ */
+export async function removeQuestionFromExams(questionId) {
+  await ensureInitialized();
+  const collection = await getCollection(COLLECTION_NAME);
+  const target = normalizeText(questionId).toUpperCase();
+  const affected = (await loadExamRows()).filter(
+    (exam) => exam.mode === 'fixed' && (exam.questionIds ?? []).includes(target)
+  );
+
+  for (const exam of affected) {
+    const questionIdsLeft = exam.questionIds.filter((id) => id !== target);
+    const next = normalizeExamRecord(
+      {
+        ...exam,
+        questionIds: questionIdsLeft,
+        questionCount: Math.min(exam.questionCount, questionIdsLeft.length),
+        updatedAt: Date.now(),
+      },
+      { fallbackId: exam.id, fallbackCreatedAt: exam.createdAt }
+    );
+    await collection.replaceOne({ id: exam.id }, next, { upsert: false });
+  }
+
+  invalidateExamCache();
+  return affected.map((exam) => exam.id);
+}
+
+export async function deleteExam(examId) {
+  await ensureInitialized();
+  const id = sanitizeExamId(examId);
+  if (!id || id === 'general') {
+    return false;
+  }
+
+  const collection = await getCollection(COLLECTION_NAME);
+  const result = await collection.deleteOne({ id });
+  invalidateExamCache();
+  return (result.deletedCount ?? 0) > 0;
 }
 
 export function toPublicExam(exam) {
@@ -383,6 +481,10 @@ export function toPublicExam(exam) {
     maxAttempts: exam.maxAttempts,
     allowedClasses: exam.allowedClasses,
     published: exam.published,
+    archived: Boolean(exam.archived),
+    hintsAllowed: Number(exam.hintsAllowed) || 0,
+    hintClasses: exam.hintClasses ?? [],
+    hintNote: exam.hintNote ?? '',
     proctoring: exam.proctoring,
     isDefault: exam.isDefault,
     createdAt: exam.createdAt,

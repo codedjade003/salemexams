@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { getCollection } from './db.js';
-import { hashPasswordScrypt } from './authUtils.js';
+import { hashPasswordScryptAsync } from './authUtils.js';
 
 const USERS_COLLECTION = 'users';
 const HELP_COLLECTION = 'password_assistance_requests';
@@ -42,10 +42,61 @@ export function defaultPasswordFromName(fullName) {
     .replace(/[^a-z0-9]/g, '');
 }
 
+async function createUniqueIndexSafely(collection, keys, name, partialFilterExpression) {
+  try {
+    await collection.createIndex(keys, { unique: true, name, partialFilterExpression });
+  } catch (error) {
+    console.warn(
+      `[users] Could not create unique index ${name} (existing duplicate values?): ${error?.message ?? error}`
+    );
+  }
+}
+
+function duplicateKeyError(error) {
+  if (error?.code !== 11000) {
+    return null;
+  }
+
+  const keyPattern = error?.keyPattern ?? {};
+  if (keyPattern.email) {
+    const duplicate = new Error('A student account with this email already exists.');
+    duplicate.code = 'EMAIL_ALREADY_EXISTS';
+    return duplicate;
+  }
+  if (keyPattern.username) {
+    const duplicate = new Error('A student account with this username already exists.');
+    duplicate.code = 'USERNAME_ALREADY_EXISTS';
+    return duplicate;
+  }
+
+  const duplicate = new Error('A student account with these details already exists.');
+  duplicate.code = 'USER_ALREADY_EXISTS';
+  return duplicate;
+}
+
+let initializingPromise = null;
+
+export async function initUserStore() {
+  await ensureInitialized();
+}
+
 async function ensureInitialized() {
   if (initialized) {
     return;
   }
+
+  if (!initializingPromise) {
+    initializingPromise = runInitialization().finally(() => {
+      if (!initialized) {
+        initializingPromise = null;
+      }
+    });
+  }
+
+  await initializingPromise;
+}
+
+async function runInitialization() {
 
   const users = await getCollection(USERS_COLLECTION);
   const requests = await getCollection(HELP_COLLECTION);
@@ -55,6 +106,13 @@ async function ensureInitialized() {
   await users.createIndex({ email: 1 }, { name: 'idx_user_email' });
   await users.createIndex({ username: 1 }, { name: 'idx_user_username' });
   await users.createIndex({ classRoom: 1 }, { name: 'idx_user_class_room' });
+  // Database-level guarantee that two accounts can't share an email/username, even when two
+  // registrations race. Blank values are excluded. If existing data already has duplicates the
+  // index can't be built; the app keeps working on its pre-checks and logs a warning instead.
+  await createUniqueIndexSafely(users, { email: 1 }, 'uniq_user_email', { email: { $type: 'string', $gt: '' } });
+  await createUniqueIndexSafely(users, { username: 1 }, 'uniq_user_username', {
+    username: { $type: 'string', $gt: '' },
+  });
 
   await requests.createIndex({ id: 1 }, { unique: true, name: 'idx_help_id' });
   await requests.createIndex({ userKey: 1, createdAt: -1 }, { name: 'idx_help_user_key_created_at' });
@@ -68,7 +126,15 @@ function sanitizeUserInput(payload) {
   const classRoom = normalizeText(payload?.classRoom);
   const email = normalizeEmail(payload?.email);
   const username = normalizeUsername(payload?.username);
-  return { fullName, classRoom, email, username };
+  return {
+    fullName,
+    classRoom,
+    email,
+    username,
+    firstName: normalizeText(payload?.firstName),
+    middleName: normalizeText(payload?.middleName),
+    lastName: normalizeText(payload?.lastName),
+  };
 }
 
 function toPublicUser(user) {
@@ -76,6 +142,9 @@ function toPublicUser(user) {
     id: user.id,
     userKey: user.userKey,
     fullName: user.fullName,
+    firstName: user.firstName ?? '',
+    middleName: user.middleName ?? '',
+    lastName: user.lastName ?? '',
     classRoom: user.classRoom,
     email: user.email,
     username: user.username ?? '',
@@ -188,10 +257,13 @@ export async function createUserWithPassword(payload, password, options = {}) {
     id: randomUUID(),
     userKey,
     fullName: normalized.fullName,
+    firstName: normalized.firstName,
+    middleName: normalized.middleName,
+    lastName: normalized.lastName,
     classRoom: normalized.classRoom,
     email: normalized.email,
     username: normalized.username,
-    passwordHash: hashPasswordScrypt(password),
+    passwordHash: await hashPasswordScryptAsync(password),
     mustChangePassword: Boolean(options.mustChangePassword),
     disabled: false,
     createdAt: now,
@@ -200,7 +272,11 @@ export async function createUserWithPassword(payload, password, options = {}) {
     passwordUpdatedAt: options.mustChangePassword ? null : now,
   };
 
-  await users.insertOne(user);
+  try {
+    await users.insertOne({ ...user });
+  } catch (error) {
+    throw duplicateKeyError(error) ?? error;
+  }
   return stripMongoId(user);
 }
 
@@ -254,6 +330,11 @@ export async function updateUser(userId, patch) {
   if (patch?.fullName !== undefined) {
     normalizedPatch.fullName = normalizeText(patch.fullName);
   }
+  for (const key of ['firstName', 'middleName', 'lastName']) {
+    if (patch?.[key] !== undefined) {
+      normalizedPatch[key] = normalizeText(patch[key]);
+    }
+  }
   if (patch?.classRoom !== undefined) {
     normalizedPatch.classRoom = normalizeText(patch.classRoom);
   }
@@ -294,7 +375,15 @@ export async function updateUser(userId, patch) {
     }
   }
 
-  await users.replaceOne({ id: userId }, nextUser);
+  try {
+    await users.replaceOne({ id: userId }, nextUser);
+  } catch (error) {
+    const duplicate = duplicateKeyError(error);
+    if (duplicate) {
+      throw new Error(duplicate.message.replace('A student account', 'Another account'));
+    }
+    throw error;
+  }
   return nextUser;
 }
 

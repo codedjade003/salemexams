@@ -22,6 +22,10 @@ export const CLASS_OPTIONS = [
   'SS2 B',
   'SS2 C',
   'SS2 D',
+  'SS3 A',
+  'SS3 B',
+  'SS3 C',
+  'SS3 D',
 ];
 
 export const DEFAULT_QUESTION_BANK = [

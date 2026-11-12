@@ -371,18 +371,25 @@ async function main() {
     await startServer();
     printStep('Server is healthy');
 
-    const fullName = `Smoke Student ${timestamp}`;
-    const classRoom = 'JSS1 A';
-    const email = `smoke.${timestamp}@example.com`;
+    const classRoom = 'SS3 A';
     const username = `smoke_user_${timestamp}`;
-    const password = `Sm0ke!${timestamp}`;
+    const password = 'salem';
 
+    await requestJsonExpectError(baseUrl, '/api/student/register', 400, 'in full', {
+      method: 'POST',
+      json: { firstName: 'Smoke', middleName: 'T', lastName: 'Tester', classRoom, username },
+    });
     const registerPayload = await requestJson(baseUrl, '/api/student/register', {
       method: 'POST',
-      json: { fullName, classRoom, email, username, password },
+      json: { firstName: 'sMOKE', middleName: 'mary-jane', lastName: "o'TESTER", classRoom, username },
     });
     assert(typeof registerPayload.token === 'string' && registerPayload.token.length > 10, 'Register token missing.');
-    printStep('Student registration passed');
+    assert(
+      registerPayload.user?.fullName === "Smoke Mary-Jane O'Tester",
+      `Names should be stored in name case, got "${registerPayload.user?.fullName}".`
+    );
+    assert(registerPayload.user?.mustChangePassword === true, 'New accounts must be asked to change the starting password.');
+    printStep('Student registration passed (names capitalised, starting password must be changed)');
 
     const loginPayload = await requestJson(baseUrl, '/api/student/login', {
       method: 'POST',
@@ -393,20 +400,24 @@ async function main() {
 
     const studentApi = buildStudentApi(baseUrl, loginPayload.token);
     const meBeforePasswordChange = await studentApi.fetchMe();
-    assert(meBeforePasswordChange?.user?.email === email, 'Student profile fetch failed before password change.');
+    assert(meBeforePasswordChange?.user?.username === username, 'Student profile fetch failed before password change.');
 
-    const newPassword = `${password}9`;
-    await studentApi.changePassword({
-      currentPassword: password,
-      newPassword,
+    const newPassword = 'mine9';
+    await requestJsonExpectError(baseUrl, '/api/student/change-password', 400, 'different from the starting password', {
+      method: 'POST',
+      headers: withStudentHeaders(loginPayload.token),
+      json: { newPassword: 'SALEM' },
     });
+    // While a change is required the student is not asked for the starting password again.
+    const changed = await studentApi.changePassword({ newPassword });
+    assert(changed?.user?.mustChangePassword === false, 'Password change should clear the must-change flag.');
     printStep('Password change passed');
 
     await requestJsonExpectError(
       baseUrl,
       '/api/student/login',
       401,
-      'invalid password',
+      'password is not right',
       {
         method: 'POST',
         json: { identifier: username, password },
@@ -448,7 +459,7 @@ async function main() {
     await startServer();
 
     const afterRestartDashboard = await examApi.fetchMe();
-    assert(afterRestartDashboard?.user?.email === email, 'Token did not survive restart.');
+    assert(afterRestartDashboard?.user?.username === username, 'Token did not survive restart.');
     printStep('Student token is still valid after server restart');
 
     const started = await examApi.startExam({ examId: selectedExam.id });
@@ -499,6 +510,43 @@ async function main() {
     }
     printStep('Seen + answer save passed for first 5 questions');
 
+    // Regression guard: the question ID decides where an answer goes. A missing index used to
+    // resolve to position 0, so answers without an index all overwrote question 1.
+    const idOnlyQuestions = started.questions.slice(10, 13);
+    let idOnlyResult;
+    for (const question of idOnlyQuestions) {
+      idOnlyResult = await examApi.saveAnswer(started.sessionId, {
+        questionId: question.id,
+        selectedOptionIds: [question.options[1].id],
+      });
+    }
+    const mismatched = started.questions[13];
+    idOnlyResult = await examApi.saveAnswer(started.sessionId, {
+      questionId: mismatched.id,
+      questionIndex: 0,
+      selectedOptionIds: [mismatched.options[2].id],
+    });
+    for (const question of idOnlyQuestions) {
+      assert(
+        idOnlyResult.responses?.[question.id]?.[0] === question.options[1].id,
+        `Answer sent without questionIndex was not stored under ${question.id}.`
+      );
+    }
+    assert(
+      idOnlyResult.responses?.[mismatched.id]?.[0] === mismatched.options[2].id,
+      'Question ID must win over a conflicting questionIndex.'
+    );
+    const firstQuestion = started.questions[0];
+    const firstExpected =
+      firstQuestion.type === 'multi'
+        ? firstQuestion.options.slice(0, 2).map((item) => item.id)
+        : [firstQuestion.options[0].id];
+    assert(
+      JSON.stringify(idOnlyResult.responses?.[firstQuestion.id]) === JSON.stringify(firstExpected),
+      'A conflicting questionIndex overwrote question 1.'
+    );
+    printStep('Answers are stored under the question ID, with or without an index');
+
     await examApi.saveFlag(started.sessionId, {
       questionId: targetQuestions[0].id,
       questionIndex: 0,
@@ -532,6 +580,34 @@ async function main() {
       detail: 'smoke test event',
     });
     printStep('Flag + proctor logging passed');
+
+    // Regression guard: an in-progress attempt must never expose a score. Previously the dashboard
+    // and trial endpoints returned a live correctCount, which let students discover answers.
+    const midExamDashboard = await examApi.fetchMe();
+    const midExamTrial = (midExamDashboard.trials ?? []).find((row) => row.id === started.sessionId);
+    assert(midExamTrial, 'Active trial missing from dashboard.');
+    assert(midExamTrial.summary === null, 'Dashboard must not expose a score for an active attempt.');
+    assert(midExamTrial.progress?.answeredCount >= 1, 'Active trial should report answered progress.');
+    const midExamTrials = await examApi.listTrials();
+    assert(
+      (midExamTrials.trials ?? []).every((row) => row.status !== 'active' || row.summary === null),
+      '/api/student/trials must not expose a score for an active attempt.'
+    );
+    const midExamTrialDetail = await examApi.getTrial(started.sessionId);
+    assert(midExamTrialDetail.trial.summary === null, 'Trial detail must not expose a score mid-exam.');
+    await requestJsonExpectError(
+      baseUrl,
+      `/api/student/trials/${encodeURIComponent(started.sessionId)}/report-card`,
+      409,
+      'after the exam is submitted',
+      { method: 'GET', headers: withStudentHeaders(reloginPayload.token) }
+    );
+    await requestJsonExpectError(baseUrl, '/api/exam/start', 409, 'already have an active trial', {
+      method: 'POST',
+      headers: withStudentHeaders(reloginPayload.token),
+      json: { examId: selectedExam.id },
+    });
+    printStep('No score is exposed while the exam is in progress');
 
     const preSubmitFeedback = await requestJsonExpectError(
       baseUrl,
@@ -573,7 +649,7 @@ async function main() {
       'Student report card should include session ID.'
     );
     assert(
-      studentReportCard.body.includes('Final Score'),
+      studentReportCard.body.toLowerCase().includes('final score'),
       'Student report card should include score summary.'
     );
     printStep('Student report card download endpoint passed');
@@ -620,7 +696,7 @@ async function main() {
     printStep('Admin branding + report card endpoints passed');
 
     const usersPayload = await adminApi.fetchUsers({ search: username });
-    const matchedUser = (usersPayload?.users ?? []).find((row) => row.username === username || row.email === email);
+    const matchedUser = (usersPayload?.users ?? []).find((row) => row.username === username);
     assert(matchedUser?.id, 'Admin users list did not include smoke student.');
 
     const adminResetPassword = `${newPassword}x`;
@@ -639,7 +715,7 @@ async function main() {
       baseUrl,
       '/api/student/login',
       401,
-      'invalid password',
+      'password is not right',
       {
         method: 'POST',
         json: { identifier: username, password: newPassword },
@@ -652,6 +728,54 @@ async function main() {
     });
     assert(postResetLogin?.user?.mustChangePassword === true, 'Post-reset login should require password change.');
     printStep('Admin password reset flow passed');
+
+    const adminHeaders = withAdminHeaders(adminLoginPayload.token);
+    const createdQuestion = await requestJson(baseUrl, '/api/admin/questions', {
+      method: 'POST',
+      headers: adminHeaders,
+      json: {
+        sourceExamId: 'general',
+        topic: 'general',
+        type: 'single',
+        text: 'Smoke question: which key confirms a dialog?',
+        optionTexts: ['Enter', 'Shift', 'Tab', 'Alt'],
+        correctOptionIds: ['A'],
+      },
+    });
+    const questionId = createdQuestion?.question?.id;
+    assert(questionId, 'Admin question create failed.');
+    const editedQuestion = await requestJson(baseUrl, `/api/admin/questions/${questionId}`, {
+      method: 'PATCH',
+      headers: adminHeaders,
+      json: { text: 'Smoke question (edited): which key confirms a dialog?', correctOptionIds: ['A'] },
+    });
+    assert(editedQuestion?.question?.text?.includes('(edited)'), 'Admin question edit failed.');
+    await requestJson(baseUrl, `/api/admin/questions/${questionId}`, { method: 'DELETE', headers: adminHeaders });
+    await requestJsonExpectError(baseUrl, `/api/admin/questions/${questionId}`, 404, 'not found', {
+      method: 'DELETE',
+      headers: adminHeaders,
+    });
+    await requestJsonExpectError(baseUrl, '/api/admin/exams/general', 400, 'cannot be deleted', {
+      method: 'DELETE',
+      headers: adminHeaders,
+    });
+    printStep('Admin question create/edit/delete passed');
+
+    await requestJson(baseUrl, '/api/student/logout', {
+      method: 'POST',
+      headers: withStudentHeaders(postResetLogin.token),
+    });
+    await requestJsonExpectError(baseUrl, '/api/student/me', 401, 'invalid or expired', {
+      method: 'GET',
+      headers: withStudentHeaders(postResetLogin.token),
+    });
+    await requestJson(baseUrl, '/api/admin/logout', { method: 'POST', headers: adminHeaders });
+    await requestJsonExpectError(baseUrl, '/api/admin/overview', 401, 'invalid or expired', {
+      method: 'GET',
+      headers: adminHeaders,
+    });
+    await requestJsonExpectError(baseUrl, '/api/does-not-exist', 404, 'not found', { method: 'GET' });
+    printStep('Logout revokes tokens server-side; unknown API routes return JSON 404');
 
     client = new MongoClient(mongoUri, {
       maxPoolSize: 5,
@@ -674,7 +798,7 @@ async function main() {
       'Feedback comment not persisted.'
     );
 
-    const savedGeneralFeedback = await db.collection('student_general_feedback').findOne({ email });
+    const savedGeneralFeedback = await db.collection('student_general_feedback').findOne({ userId: matchedUser.id });
     assert(savedGeneralFeedback, 'General dashboard feedback not found in MongoDB.');
     assert(
       (savedGeneralFeedback.comment ?? '').includes('Dashboard feedback from smoke test'),

@@ -13,6 +13,7 @@ dist-ssr
 *.local
 .env
 .env.*
+*.env
 !.env.example
 
 # Editor directories and files
@@ -25,3 +26,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Python runtime copied from node_modules at build time
+public/pyodide

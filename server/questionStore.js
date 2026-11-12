@@ -1,12 +1,13 @@
 import { DEFAULT_QUESTION_BANK } from './questions.js';
 import { getCollection } from './db.js';
+import { validateQuestion } from './questionModel.js';
 
 const COLLECTION_NAME = 'questions';
 let initialized = false;
 let initializingPromise = null;
 
 function clone(value) {
-  return JSON.parse(JSON.stringify(value));
+  return structuredClone(value);
 }
 
 function normalizeText(value) {
@@ -33,81 +34,6 @@ async function getNextQuestionId(collection) {
   }, 0);
 
   return `Q${String(maxId + 1).padStart(3, '0')}`;
-}
-
-function sanitizeOptionTexts(optionTexts) {
-  if (!Array.isArray(optionTexts)) {
-    return [];
-  }
-
-  return optionTexts.slice(0, 4).map((text) => normalizeText(text));
-}
-
-function sanitizeCorrectOptionIds(correctOptionIds) {
-  if (!Array.isArray(correctOptionIds)) {
-    return [];
-  }
-
-  const validIds = new Set(['A', 'B', 'C', 'D']);
-  return [...new Set(correctOptionIds.map((id) => String(id).toUpperCase()))].filter((id) =>
-    validIds.has(id)
-  );
-}
-
-function validateQuestion(question, generatedId = '') {
-  if (!question || typeof question !== 'object') {
-    throw new Error('Invalid question payload.');
-  }
-
-  const text = normalizeText(question.text);
-  if (text.length < 5) {
-    throw new Error('Question text must be at least 5 characters.');
-  }
-
-  const type = normalizeText(question.type).toLowerCase();
-  if (!['single', 'multi'].includes(type)) {
-    throw new Error('Question type must be single or multi.');
-  }
-
-  const topic = normalizeText(question.topic).toLowerCase() || 'general';
-
-  const optionTexts = sanitizeOptionTexts(
-    question.optionTexts ?? question.options?.map((option) => option?.text)
-  );
-  if (optionTexts.length !== 4 || optionTexts.some((item) => item.length < 1)) {
-    throw new Error('Question must have 4 options.');
-  }
-
-  const options = optionTexts.map((textValue, index) => ({
-    id: ['A', 'B', 'C', 'D'][index],
-    text: textValue,
-  }));
-
-  const correctOptionIds = sanitizeCorrectOptionIds(question.correctOptionIds);
-  if (correctOptionIds.length < 1) {
-    throw new Error('Select at least one correct option.');
-  }
-
-  if (type === 'single' && correctOptionIds.length !== 1) {
-    throw new Error('Single-choice question must have exactly one correct option.');
-  }
-
-  const id = normalizeText(question.id) || generatedId;
-  if (!/^Q\d{3,}$/i.test(id)) {
-    throw new Error('Question ID must look like Q001.');
-  }
-
-  const sourceExamId = normalizeExamId(question.sourceExamId) || 'general';
-
-  return {
-    id: id.toUpperCase(),
-    topic,
-    type,
-    text,
-    options,
-    correctOptionIds,
-    sourceExamId,
-  };
 }
 
 function stripMongoId(value) {
@@ -164,18 +90,49 @@ async function ensureInitialized() {
   }
 }
 
+// The question bank is read on every exam start and by the public meta endpoint, but only
+// changes through the admin dashboard. Cache it briefly; every write invalidates immediately.
+const QUESTION_CACHE_TTL_MS = 15_000;
+let questionCache = null;
+let questionCacheLoad = null;
+
+function invalidateQuestionCache() {
+  questionCache = null;
+  questionCacheLoad = null;
+}
+
+async function loadQuestionRows() {
+  if (questionCache && questionCache.expiresAt > Date.now()) {
+    return questionCache.rows;
+  }
+
+  if (!questionCacheLoad) {
+    questionCacheLoad = (async () => {
+      const collection = await getCollection(COLLECTION_NAME);
+      const rows = (await collection.find({}).toArray()).map((item) => stripMongoId(item));
+      questionCache = { rows, expiresAt: Date.now() + QUESTION_CACHE_TTL_MS };
+      return rows;
+    })().finally(() => {
+      questionCacheLoad = null;
+    });
+  }
+
+  return questionCacheLoad;
+}
+
 export async function getQuestionPool() {
   await ensureInitialized();
-  const collection = await getCollection(COLLECTION_NAME);
-  const questions = await collection.find({}).toArray();
-  return questions.map((item) => clone(stripMongoId(item)));
+  return clone(await loadQuestionRows());
 }
 
 export async function getQuestionByIdMap() {
+  const questions = await getQuestionPool();
+  return new Map(questions.map((question) => [question.id, question]));
+}
+
+export async function getQuestionPoolCount() {
   await ensureInitialized();
-  const collection = await getCollection(COLLECTION_NAME);
-  const questions = await collection.find({}).toArray();
-  return new Map(questions.map((question) => [question.id, clone(stripMongoId(question))]));
+  return (await loadQuestionRows()).length;
 }
 
 export async function addQuestion(payload) {
@@ -190,27 +147,62 @@ export async function addQuestion(payload) {
     throw new Error('Question ID already exists.');
   }
 
-  await collection.insertOne(nextQuestion);
+  await collection.insertOne({ ...nextQuestion });
+  invalidateQuestionCache();
   return clone(nextQuestion);
 }
 
-export async function replaceQuestionPool(nextQuestions) {
+export async function getQuestion(questionId) {
   await ensureInitialized();
+  const id = normalizeText(questionId).toUpperCase();
+  const found = (await loadQuestionRows()).find((question) => question.id === id);
+  return found ? clone(found) : null;
+}
 
-  if (!Array.isArray(nextQuestions) || nextQuestions.length === 0) {
-    throw new Error('Question pool cannot be empty.');
+export async function updateQuestion(questionId, payload) {
+  await ensureInitialized();
+  const collection = await getCollection(COLLECTION_NAME);
+  const id = normalizeText(questionId).toUpperCase();
+  const existing = await collection.findOne({ id });
+  if (!existing) {
+    return null;
   }
 
-  const sanitized = nextQuestions.map((question) => validateQuestion(question, question.id));
-  const idSet = new Set(sanitized.map((question) => question.id));
+  // The ID never changes. Exam sessions keep their own snapshot of each question, so editing
+  // here only affects exams started from now on.
+  const nextQuestion = validateQuestion(
+    {
+      ...stripMongoId(existing),
+      ...payload,
+      id,
+      sourceExamId: payload?.sourceExamId ?? existing.sourceExamId,
+    },
+    id
+  );
 
-  if (idSet.size !== sanitized.length) {
-    throw new Error('Question IDs must be unique.');
+  await collection.replaceOne({ id }, nextQuestion, { upsert: false });
+  invalidateQuestionCache();
+  return clone(nextQuestion);
+}
+
+export async function deleteQuestion(questionId) {
+  await ensureInitialized();
+  const collection = await getCollection(COLLECTION_NAME);
+  const id = normalizeText(questionId).toUpperCase();
+  const result = await collection.deleteOne({ id });
+  invalidateQuestionCache();
+  return (result.deletedCount ?? 0) > 0;
+}
+
+export async function deleteQuestionsBySourceExam(examId) {
+  await ensureInitialized();
+  const sourceExamId = normalizeExamId(examId);
+  if (!sourceExamId || sourceExamId === 'general') {
+    return 0;
   }
 
   const collection = await getCollection(COLLECTION_NAME);
-  await collection.deleteMany({});
-  await collection.insertMany(sanitized);
-
-  return clone(sanitized);
+  const result = await collection.deleteMany({ sourceExamId });
+  invalidateQuestionCache();
+  return result.deletedCount ?? 0;
 }

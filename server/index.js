@@ -7,11 +7,36 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 import { CLASS_OPTIONS, EXAM_DURATION_SECONDS, EXAM_QUESTION_COUNT } from './questions.js';
-import { addQuestion, getQuestionByIdMap, getQuestionPool } from './questionStore.js';
 import {
+  buildReviewItem,
+  describeCorrectAnswer,
+  describeResponse,
+  isAnswered,
+  isResponseCorrect,
+  prepareQuestionForSession,
+  questionTypeLabel,
+  sanitizeResponse,
+  sectionRank,
+  toPublicQuestion,
+} from './questionModel.js';
+import {
+  addQuestion,
+  deleteQuestion,
+  deleteQuestionsBySourceExam,
+  getQuestion,
+  getQuestionByIdMap,
+  getQuestionPool,
+  getQuestionPoolCount,
+  updateQuestion,
+} from './questionStore.js';
+import {
+  attachExamQuestionIds,
   createExam,
+  deleteExam,
+  findExamsOnlyUsingQuestion,
   getExam,
   listExams,
+  removeQuestionFromExams,
   toPublicExam,
   updateExam,
 } from './examStore.js';
@@ -23,6 +48,7 @@ import {
   getUserById,
   getUserByKey,
   getUserByUsername,
+  initUserStore,
   listPasswordAssistanceRequests,
   listUsers,
   resolvePasswordAssistanceRequest,
@@ -31,9 +57,16 @@ import {
   updateUserPassword,
   touchUserLogin,
 } from './userStore.js';
-import { hashPasswordScrypt, parseScryptHash, verifyPasswordScrypt } from './authUtils.js';
 import {
-  cleanupExpiredAdminTokens,
+  hashPasswordScryptAsync,
+  parseScryptHash,
+  verifyPasswordScryptAsync,
+} from './authUtils.js';
+import { closeDb, getDb } from './db.js';
+import { clientIp, createRateLimiter } from './rateLimit.js';
+import { renderBulkReportCardsHtml, renderReportCardHtml, renderResultSheetHtml } from './reportCard.js';
+import { CURRENT_EXAM, CURRENT_EXAM_ID, CURRENT_EXAM_QUESTIONS, CURRENT_EXAM_SEED_KEY } from './currentExam.js';
+import {
   deleteAdminToken,
   getAdminToken,
   saveAdminToken,
@@ -48,18 +81,23 @@ import {
   updateBrandingSettings,
 } from './settingsStore.js';
 import {
-  cleanupExpiredStudentTokens,
   deleteStudentToken,
   deleteStudentTokensByUser,
   getStudentToken,
   saveStudentToken,
 } from './studentTokenStore.js';
 import {
+  countSessions,
+  countSessionsByExam,
   deleteSession,
   deleteSessions,
   getSession,
+  getSessionRevision,
+  initSessionStore,
+  insertSession,
   listSessions,
-  saveSession,
+  saveSessionIfRevision,
+  SESSION_LIST_PROJECTION,
   updateSession,
 } from './store.js';
 
@@ -73,9 +111,36 @@ const RESULT_RELEASE_DELAY_MS =
   Number.isFinite(RESULT_RELEASE_DELAY_MS_INPUT) && RESULT_RELEASE_DELAY_MS_INPUT >= 0
     ? Math.round(RESULT_RELEASE_DELAY_MS_INPUT)
     : 25 * 60 * 1000;
-const OPTION_IDS = ['A', 'B', 'C', 'D'];
-const KEEP_ALIVE_ENABLED = String(process.env.KEEP_ALIVE_ENABLED ?? 'true').toLowerCase() === 'true';
-const KEEP_ALIVE_URL = String(process.env.KEEP_ALIVE_URL ?? '').trim();
+// Writes (answers, submit) are still accepted this long after the timer reaches zero, so answers
+// already on their way when time runs out (slow school Wi-Fi, a busy server) are not lost. The
+// student's screen locks at 00:00, so this cannot be used to keep answering.
+const SUBMIT_GRACE_MS_INPUT = Number(process.env.SUBMIT_GRACE_MS ?? 90_000);
+const SUBMIT_GRACE_MS =
+  Number.isFinite(SUBMIT_GRACE_MS_INPUT) && SUBMIT_GRACE_MS_INPUT >= 0 ? Math.round(SUBMIT_GRACE_MS_INPUT) : 90_000;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// Self-ping loop for hosts that sleep idle apps (e.g. Render free tier). Not needed on a VPS.
+// Render sets RENDER=true; there the loop is on by default and pings the public URL.
+const IS_RENDER = Boolean(process.env.RENDER);
+const KEEP_ALIVE_ENABLED = String(process.env.KEEP_ALIVE_ENABLED ?? (IS_RENDER ? 'true' : 'false')).toLowerCase() === 'true';
+// Set when running behind a reverse proxy such as nginx (e.g. "loopback" or "1") so rate limits
+// see real client IPs instead of the proxy's.
+const TRUST_PROXY = String(process.env.TRUST_PROXY ?? (IS_RENDER ? 'true' : '')).trim();
+// Comma-separated list of origins allowed to call the API from another domain. Leave empty when
+// the API serves the frontend itself (same origin), which is the recommended setup.
+const CORS_ORIGINS = String(process.env.CORS_ORIGINS ?? '')
+  .split(',')
+  .map((origin) => origin.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+// Students sign up without choosing a password; they start with this one and must replace it
+// the first time they sign in. Admin password resets use it too.
+const DEFAULT_STUDENT_PASSWORD = String(process.env.DEFAULT_STUDENT_PASSWORD ?? 'salem').trim() || 'salem';
+// IANA time zone used for dates printed on report cards (e.g. "Africa/Lagos"). A VPS is often set
+// to UTC or the data centre's zone, which would print the wrong local time for students.
+const APP_TIMEZONE = String(process.env.APP_TIMEZONE ?? '').trim();
+const KEEP_ALIVE_URL = String(
+  process.env.KEEP_ALIVE_URL ??
+    (process.env.RENDER_EXTERNAL_URL ? `${process.env.RENDER_EXTERNAL_URL.replace(/\/+$/, '')}/api/keep-alive` : '')
+).trim();
 const KEEP_ALIVE_INTERVAL_MS_INPUT = Number(process.env.KEEP_ALIVE_INTERVAL_MS ?? 5 * 60 * 1000);
 const KEEP_ALIVE_INTERVAL_MS =
   Number.isFinite(KEEP_ALIVE_INTERVAL_MS_INPUT) && KEEP_ALIVE_INTERVAL_MS_INPUT >= 60_000
@@ -156,14 +221,41 @@ function toTitleCaseWords(value) {
     .join(' ');
 }
 
-function escapeHtml(value) {
-  const text = String(value ?? '');
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+/** "aDA o'NEIL-smith" -> "Ada O'Neil-Smith": capitalised after spaces, hyphens and apostrophes. */
+function toNameCase(value) {
+  return normalizeName(value)
+    .toLowerCase()
+    .replace(/(^|[\s'’-])(\p{L})/gu, (_match, separator, letter) => `${separator}${letter.toUpperCase()}`);
+}
+
+const NAME_PART_PATTERN = /^\p{L}[\p{L}'’ -]{0,39}$/u;
+
+/** Reads first/middle/last name fields (or splits a legacy fullName). */
+function readNameParts(body) {
+  let firstName = toNameCase(body?.firstName);
+  let middleName = toNameCase(body?.middleName);
+  let lastName = toNameCase(body?.lastName);
+  const legacyFullName = toNameCase(body?.fullName);
+  if (!firstName && !lastName && legacyFullName) {
+    const words = legacyFullName.split(' ');
+    firstName = words[0] ?? '';
+    lastName = words.length > 1 ? words.at(-1) : '';
+    middleName = words.slice(1, -1).join(' ');
+  }
+  return { firstName, middleName, lastName, fullName: [firstName, middleName, lastName].filter(Boolean).join(' ') };
+}
+
+/** Returns an error message for invalid names, or ''. */
+function validateNameParts({ firstName, middleName, lastName }) {
+  if (firstName.length < 2) return 'Enter your first name.';
+  if (lastName.length < 2) return 'Enter your last name (your family name).';
+  for (const part of [firstName, middleName, lastName].filter(Boolean)) {
+    if (!NAME_PART_PATTERN.test(part)) return 'Names can only use letters, spaces, hyphens and apostrophes.';
+  }
+  if (middleName && middleName.replace(/[^\p{L}]/gu, '').length < 2) {
+    return 'Write your middle name in full, not just the first letter.';
+  }
+  return '';
 }
 
 function normalizeExamId(value) {
@@ -215,7 +307,7 @@ function normalizeStoredViolation(value) {
     ? occurredAtInput
     : Date.now();
 
-  return {
+  const normalized = {
     id: normalizeName(value.id) || randomUUID(),
     type,
     detail,
@@ -228,6 +320,14 @@ function normalizeStoredViolation(value) {
         ? Number(value.waivedAt)
         : null,
   };
+  // Evidence recorded by the browser (how long the student was away, what they were doing) and
+  // any dispute. Kept as-is; it was validated when it was written.
+  for (const key of ['evidence', 'dispute']) {
+    if (value[key] && typeof value[key] === 'object') {
+      normalized[key] = value[key];
+    }
+  }
+  return normalized;
 }
 
 function getActiveViolations(session) {
@@ -306,94 +406,45 @@ function normalizeStoredFeedback(feedback) {
   };
 }
 
-function shuffleQuestionOptions(question) {
-  const shuffledOptions = shuffleArray(question.options.map((option) => ({ ...option })));
-  const options = shuffledOptions.map((option, index) => ({
-    id: OPTION_IDS[index],
-    text: option.text,
-  }));
-  const correctOptionIds = shuffledOptions
-    .map((option, index) => (question.correctOptionIds.includes(option.id) ? OPTION_IDS[index] : null))
-    .filter(Boolean);
-
-  return {
-    ...question,
-    options,
-    correctOptionIds,
-  };
-}
-
 const parsedAdminPasscodeHash = parseScryptHash(ADMIN_PASSCODE_HASH);
 
-function verifyAdminPasscode(passcode) {
-  return Boolean(parsedAdminPasscodeHash) && verifyPasswordScrypt(passcode, ADMIN_PASSCODE_HASH);
-}
-
-function asPublicQuestion(question) {
-  return {
-    id: question.id,
-    topic: question.topic,
-    type: question.type,
-    text: question.text,
-    options: question.options,
-  };
-}
-
-function hasSameOptions(left, right) {
-  if (left.length !== right.length) {
-    return false;
-  }
-
-  const rightSet = new Set(right);
-  return left.every((item) => rightSet.has(item));
-}
-
-function sanitizeSelectedOptions(question, selectedOptionIds) {
-  if (!Array.isArray(selectedOptionIds)) {
-    return [];
-  }
-
-  const allowedOptionIds = new Set(question.options.map((option) => option.id));
-  const unique = [...new Set(selectedOptionIds.filter((optionId) => allowedOptionIds.has(optionId)))];
-
-  if (question.type === 'single') {
-    return unique.slice(0, 1);
-  }
-
-  return unique;
+async function verifyAdminPasscode(passcode) {
+  return Boolean(parsedAdminPasscodeHash) && verifyPasswordScryptAsync(passcode, ADMIN_PASSCODE_HASH);
 }
 
 function normalizeQuestionId(value) {
   return normalizeName(value).toUpperCase();
 }
 
-function resolveSessionQuestionId(session, requestedQuestionId, requestedQuestionIndex = null) {
+/**
+ * The question ID is authoritative; the position is only a fallback for clients holding a stale
+ * or differently-cased ID. (Previously the position won, and because a missing index defaulted
+ * to null and Number(null) === 0, a request without an index silently overwrote question 1.)
+ */
+function resolveSessionQuestionId(session, requestedQuestionId, requestedQuestionIndex) {
   const order = Array.isArray(session?.questionOrder) ? session.questionOrder : [];
   if (!order.length) {
     return null;
   }
 
-  const indexValue = Number(requestedQuestionIndex);
-  if (Number.isFinite(indexValue)) {
-    const safeIndex = Math.trunc(indexValue);
-    if (safeIndex >= 0 && safeIndex < order.length) {
-      return order[safeIndex];
-    }
-  }
-
-  if (order.includes(requestedQuestionId)) {
+  if (requestedQuestionId && order.includes(requestedQuestionId)) {
     return requestedQuestionId;
   }
 
   const normalizedRequested = normalizeQuestionId(requestedQuestionId);
-  if (!normalizedRequested) {
-    return null;
+  if (normalizedRequested) {
+    for (const questionId of order) {
+      if (normalizeQuestionId(questionId) === normalizedRequested) {
+        return questionId;
+      }
+    }
   }
 
-  for (const questionId of order) {
-    if (normalizeQuestionId(questionId) === normalizedRequested) {
-      return questionId;
-    }
+  const hasIndex =
+    requestedQuestionIndex !== null && requestedQuestionIndex !== undefined && requestedQuestionIndex !== '';
+  const indexValue = hasIndex ? Number(requestedQuestionIndex) : NaN;
+  if (Number.isInteger(indexValue) && indexValue >= 0 && indexValue < order.length) {
+    return order[indexValue];
   }
 
   return null;
@@ -423,6 +474,21 @@ function resolveQuestionFromSnapshot(session, questionId) {
   return null;
 }
 
+/** Admin override for one question (true/false), or null when the automatic mark stands. */
+function getManualGrade(session, questionId) {
+  const value = session.manualGrades?.[questionId];
+  return value === true || value === false ? value : null;
+}
+
+function isQuestionCorrect(session, questionId) {
+  const manual = getManualGrade(session, questionId);
+  if (manual !== null) {
+    return manual;
+  }
+  const question = session.questionSnapshot?.[questionId];
+  return question ? isResponseCorrect(question, session.answers?.[questionId]) : false;
+}
+
 function evaluateSession(session) {
   let correctCount = 0;
   let answeredCount = 0;
@@ -433,12 +499,11 @@ function evaluateSession(session) {
       continue;
     }
 
-    const selected = session.answers[questionId] ?? [];
-    if (selected.length > 0) {
+    if (isAnswered(question, session.answers?.[questionId])) {
       answeredCount += 1;
     }
 
-    if (hasSameOptions(selected, question.correctOptionIds)) {
+    if (isQuestionCorrect(session, questionId)) {
       correctCount += 1;
     }
   }
@@ -576,7 +641,7 @@ function toClientSession(session) {
   const questionList = session.questionOrder
     .map((questionId) => session.questionSnapshot?.[questionId])
     .filter(Boolean)
-    .map(asPublicQuestion);
+    .map(toPublicQuestion);
 
   return {
     sessionId: session.id,
@@ -604,7 +669,30 @@ function toClientSession(session) {
     questionReview: buildStudentQuestionReview(session),
     summary: session.summary,
     feedback: session.feedback ?? null,
+    hints: buildClientHints(session),
   };
+}
+
+/** How many hints a student in `classRoom` gets for `exam` (0 unless the exam enables them). */
+function hintLimitFor(exam, classRoom) {
+  const allowed = Number(exam?.hintsAllowed) || 0;
+  return allowed > 0 && (exam.hintClasses ?? []).includes(classRoom) ? allowed : 0;
+}
+
+/** The student's hint budget and the hints already revealed (so they survive a refresh). */
+function buildClientHints(session) {
+  const revealed = {};
+  for (const questionId of Object.keys(session.hintsUsed ?? {})) {
+    const hint = session.questionSnapshot?.[questionId]?.hint;
+    if (hint) revealed[questionId] = hint;
+  }
+  const limit = Number(session.hintLimit) || 0;
+  return { limit, used: Object.keys(session.hintsUsed ?? {}).length, revealed };
+}
+
+/** True once the exam time and the grace period for in-flight answers have both passed. */
+function isPastGrace(session, now = Date.now()) {
+  return now >= Number(session.expiresAt) + SUBMIT_GRACE_MS;
 }
 
 function sessionStatus(session) {
@@ -717,7 +805,7 @@ async function normalizeSession(session) {
     changed = true;
   }
 
-  if (!next.submittedAt && Date.now() >= next.expiresAt) {
+  if (!next.submittedAt && isPastGrace(next)) {
     next = finalizeSession(next);
     changed = true;
   }
@@ -739,7 +827,13 @@ async function normalizeSession(session) {
   }
 
   if (changed) {
-    await saveSession(next);
+    // Conditional write: if the student saved an answer between our read and this write, keep
+    // their write and skip ours (the next read normalizes again). This used to be an
+    // unconditional replace that could silently drop a just-saved answer.
+    const saved = await saveSessionIfRevision(next, getSessionRevision(session));
+    if (saved) {
+      return saved;
+    }
   }
 
   return next;
@@ -754,9 +848,193 @@ async function getLatestSession(sessionId) {
   return normalizeSession(existing);
 }
 
-async function getLatestSessions() {
-  const sessions = await listSessions();
-  return Promise.all(sessions.map((session) => normalizeSession(session)));
+function stripQuestionSnapshot(session) {
+  if (!session) {
+    return session;
+  }
+
+  const { questionSnapshot: _ignoredSnapshot, ...rest } = session;
+  return rest;
+}
+
+/**
+ * Cheap, read-only normalization for list views. Works on documents fetched without the
+ * question snapshot and never writes to the database.
+ */
+function normalizeSessionLite(session, examMap) {
+  const student = {
+    fullName: normalizeName(session.student?.fullName ?? ''),
+    classRoom: normalizeName(session.student?.classRoom ?? ''),
+    email: normalizeEmail(session.student?.email ?? ''),
+    username: normalizeUsername(session.student?.username ?? ''),
+  };
+  const examId = normalizeExamId(session.examId) || 'general';
+  const exam = examMap?.get(examId) ?? null;
+  const examMaxAttemptsInput = Number(session.examMaxAttempts);
+  const trialNumberInput = Number(session.trialNumber);
+
+  return {
+    ...session,
+    student,
+    examId,
+    examTitle: normalizeName(session.examTitle) || exam?.title || 'General Exam Pool',
+    examMaxAttempts:
+      Number.isFinite(examMaxAttemptsInput) && examMaxAttemptsInput > 0
+        ? Math.round(examMaxAttemptsInput)
+        : Number(exam?.maxAttempts ?? 3),
+    trialNumber: Number.isFinite(trialNumberInput) && trialNumberInput > 0 ? Math.round(trialNumberInput) : 1,
+    studentKey: normalizeName(session.studentKey) || buildStudentKey(student, examId),
+    userKey: normalizeName(session.userKey) || buildUserKey(student),
+    userId: normalizeName(session.userId) || null,
+    durationSeconds: session.durationSeconds ?? EXAM_DURATION_SECONDS,
+    answers: session.answers ?? {},
+    flagged: session.flagged ?? {},
+    seen: session.seen ?? {},
+    violations: (Array.isArray(session.violations) ? session.violations : [])
+      .map((violation) => normalizeStoredViolation(violation))
+      .filter(Boolean),
+    questionOrder: Array.isArray(session.questionOrder) ? session.questionOrder : [],
+    feedback: normalizeStoredFeedback(session.feedback),
+    resultsAvailableAt: session.submittedAt ? getResultsAvailableAt(session) : null,
+  };
+}
+
+/**
+ * Loads sessions for list views (dashboards, admin tables, exports) without question snapshots.
+ * Sessions that ran out of time without being submitted (student closed the browser) are
+ * finalized here, as the old full-scan did, so they still count towards results.
+ */
+async function loadSessionList(filter = {}, projection = SESSION_LIST_PROJECTION) {
+  const [rows, exams] = await Promise.all([listSessions({ filter, projection }), listExams()]);
+  const examMap = new Map(exams.map((exam) => [exam.id, exam]));
+  const now = Date.now();
+  const needsFullNormalize = rows.filter(
+    (session) =>
+      (!session.submittedAt && isPastGrace(session, now)) || (session.submittedAt && !session.summary)
+  );
+
+  const refreshed = new Map();
+  if (needsFullNormalize.length > 0) {
+    const fullSessions = await Promise.all(needsFullNormalize.map((session) => getLatestSession(session.id)));
+    for (const fullSession of fullSessions) {
+      if (fullSession) {
+        refreshed.set(fullSession.id, stripQuestionSnapshot(fullSession));
+      }
+    }
+    invalidateLeaderboardCache();
+  }
+
+  return rows.map((session) => normalizeSessionLite(refreshed.get(session.id) ?? session, examMap));
+}
+
+function studentSessionFilter(user) {
+  const clauses = [{ userId: user.id }];
+  if (user.userKey) {
+    clauses.push({ userKey: user.userKey });
+  }
+  return { $or: clauses };
+}
+
+async function loadStudentTrials(user) {
+  const sessions = await loadSessionList(studentSessionFilter(user));
+  return sessions
+    .filter((session) => studentOwnsSession(user, session))
+    .sort((left, right) => right.startedAt - left.startedAt);
+}
+
+// Leaderboards are shown on every student dashboard load. Rebuilding them for each request
+// meant a full collection scan per login; now they are rebuilt at most every few seconds and
+// immediately after a submission or an admin change.
+const LEADERBOARD_CACHE_TTL_MS = 10_000;
+const LEADERBOARD_PROJECTION = Object.freeze({
+  _id: 0,
+  id: 1,
+  userId: 1,
+  userKey: 1,
+  studentKey: 1,
+  student: 1,
+  examId: 1,
+  examTitle: 1,
+  startedAt: 1,
+  expiresAt: 1,
+  submittedAt: 1,
+  summary: 1,
+});
+let leaderboardCache = null;
+let leaderboardLoad = null;
+let leaderboardGeneration = 0;
+
+function invalidateLeaderboardCache() {
+  leaderboardCache = null;
+  leaderboardGeneration += 1;
+}
+
+async function getLeaderboardRows() {
+  if (leaderboardCache && leaderboardCache.expiresAt > Date.now()) {
+    return leaderboardCache.rows;
+  }
+
+  if (!leaderboardLoad) {
+    const generation = leaderboardGeneration;
+    leaderboardLoad = (async () => {
+      const sessions = await loadSessionList({}, LEADERBOARD_PROJECTION);
+      const rows = buildStudentLeaderboardRows(sessions);
+      if (generation === leaderboardGeneration) {
+        leaderboardCache = { rows, expiresAt: Date.now() + LEADERBOARD_CACHE_TTL_MS };
+      }
+      return rows;
+    })().finally(() => {
+      leaderboardLoad = null;
+    });
+  }
+
+  return leaderboardLoad;
+}
+
+async function loadStudentDashboard(user) {
+  const [exams, trials, leaderboardRows, generalFeedbackHistory] = await Promise.all([
+    listExams(),
+    loadStudentTrials(user),
+    getLeaderboardRows(),
+    listGeneralFeedbackByUser(user.id, 8),
+  ]);
+
+  const activeTrial = trials.find((session) => !session.submittedAt && sessionStatus(session) === 'active');
+  let activeSession = activeTrial ? await getLatestSession(activeTrial.id) : null;
+  if (activeSession?.submittedAt) {
+    activeSession = null;
+  }
+
+  return {
+    generalFeedbackHistory,
+    ...buildStudentDashboardPayload(user, exams, trials, leaderboardRows, activeSession),
+  };
+}
+
+// Serializes exam starts per student so a double-click (or two tabs) cannot create two trials
+// at once and exceed the attempt limit. In-process lock: fine for a single Node process.
+const examStartLocks = new Map();
+
+function withExamStartLock(key, task) {
+  const previous = examStartLocks.get(key) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(task);
+  const tail = run.catch(() => undefined);
+  examStartLocks.set(key, tail);
+  void tail.then(() => {
+    if (examStartLocks.get(key) === tail) {
+      examStartLocks.delete(key);
+    }
+  });
+  return run;
+}
+
+async function finalizeIfExpired(sessionId) {
+  return updateSession(sessionId, (current) => {
+    if (current.submittedAt || !isPastGrace(current)) {
+      return current;
+    }
+    return finalizeSession(current);
+  });
 }
 
 async function getUpdatableSessionOrError(sessionId, res, studentUser = null) {
@@ -777,9 +1055,9 @@ async function getUpdatableSessionOrError(sessionId, res, studentUser = null) {
     return null;
   }
 
-  if (Date.now() >= session.expiresAt) {
-    const finalized = finalizeSession(session);
-    await saveSession(finalized);
+  if (isPastGrace(session)) {
+    const finalized = (await finalizeIfExpired(sessionId)) ?? finalizeSession(session);
+    invalidateLeaderboardCache();
     res.status(409).json({ error: 'Exam time is over.', session: toStudentClientSession(finalized) });
     return null;
   }
@@ -807,7 +1085,7 @@ async function applyActiveSessionUpdateOrError(sessionId, res, studentUser, upda
       return null;
     }
 
-    if (Date.now() >= current.expiresAt) {
+    if (isPastGrace(current)) {
       const finalized = finalizeSession(current);
       rejectedResponse = {
         status: 409,
@@ -844,9 +1122,9 @@ async function applyActiveSessionUpdateOrError(sessionId, res, studentUser, upda
     return null;
   }
 
-  if (Date.now() >= latest.expiresAt) {
-    const finalized = finalizeSession(latest);
-    await saveSession(finalized);
+  if (isPastGrace(latest)) {
+    const finalized = (await finalizeIfExpired(sessionId)) ?? finalizeSession(latest);
+    invalidateLeaderboardCache();
     res.status(409).json({ error: 'Exam time is over.', session: toStudentClientSession(finalized) });
     return null;
   }
@@ -858,17 +1136,9 @@ async function applyActiveSessionUpdateOrError(sessionId, res, studentUser, upda
   return null;
 }
 
-async function cleanupAdminTokens() {
-  await cleanupExpiredAdminTokens(Date.now());
-}
-
-async function cleanupStudentTokens() {
-  await cleanupExpiredStudentTokens(Date.now());
-}
-
+// Expired tokens are removed by MongoDB's TTL indexes (see the token stores) and rejected on
+// use below, so no per-request cleanup query is needed.
 async function issueAdminToken() {
-  await cleanupAdminTokens();
-
   const token = randomUUID();
   const createdAt = Date.now();
   const expiresAt = createdAt + ADMIN_TOKEN_LIFETIME_MS;
@@ -878,8 +1148,6 @@ async function issueAdminToken() {
 }
 
 async function issueStudentToken(user) {
-  await cleanupStudentTokens();
-
   const token = randomUUID();
   const createdAt = Date.now();
   const expiresAt = createdAt + STUDENT_TOKEN_LIFETIME_MS;
@@ -913,8 +1181,6 @@ function getBearerToken(req) {
 }
 
 async function requireAdmin(req, res, next) {
-  await cleanupAdminTokens();
-
   const token = getBearerToken(req);
   if (!token) {
     res.status(401).json({ error: 'Missing admin token.' });
@@ -938,8 +1204,6 @@ async function requireAdmin(req, res, next) {
 }
 
 async function requireStudent(req, res, next) {
-  await cleanupStudentTokens();
-
   const token = getBearerToken(req);
   if (!token) {
     res.status(401).json({ error: 'Missing student token.' });
@@ -1031,7 +1295,8 @@ function toSessionRow(session) {
     violationsCount: activeViolationsCount,
     totalViolationsCount,
     waivedViolationsCount,
-    answeredCount: session.summary?.answeredCount ?? 0,
+    totalQuestions: session.summary?.totalQuestions ?? (session.questionOrder ?? []).length,
+    answeredCount: session.summary?.answeredCount ?? countAnsweredQuestions(session),
     correctCount: session.summary?.correctCount ?? 0,
     rawPercent: session.summary?.rawPercent ?? 0,
     finalPercent: session.summary?.finalPercent ?? 0,
@@ -1041,9 +1306,27 @@ function toSessionRow(session) {
   };
 }
 
+function hasAnyAnswer(value) {
+  if (Array.isArray(value)) {
+    return value.some((entry) => entry !== null && entry !== undefined && entry !== '');
+  }
+  if (value && typeof value === 'object') {
+    return Boolean(String(value.code ?? '').trim());
+  }
+  return false;
+}
+
+/** Answered-question count for list views, which load attempts without their questions. */
+function countAnsweredQuestions(session) {
+  return (session.questionOrder ?? []).filter((questionId) => hasAnyAnswer(session.answers?.[questionId])).length;
+}
+
 function toStudentTrialRow(session) {
   const released = isResultsReleased(session);
-  const summary = session.summary ?? evaluateSession(session);
+  // SECURITY: never score an unsubmitted session for the student. Returning a live summary here
+  // let a student flip an answer, reload the dashboard and watch correctCount change, revealing
+  // every correct answer mid-exam. In-progress trials only report how many questions are answered.
+  const summary = session.submittedAt ? session.summary ?? null : null;
   return {
     id: session.id,
     exam: {
@@ -1060,6 +1343,10 @@ function toStudentTrialRow(session) {
     resultsReleased: released,
     durationSeconds: session.durationSeconds ?? EXAM_DURATION_SECONDS,
     summary,
+    progress: {
+      answeredCount: countAnsweredQuestions(session),
+      totalQuestions: (session.questionOrder ?? []).length,
+    },
     violations: session.violations ?? [],
     feedback: session.feedback ?? null,
   };
@@ -1070,8 +1357,14 @@ function csvEscape(value) {
     return '';
   }
 
-  const text = String(value);
-  if (!/[",\n]/.test(text)) {
+  let text = String(value);
+  // Neutralize spreadsheet formulas: student-entered names or comments starting with = + - @
+  // would otherwise execute when an admin opens the export in Excel or Sheets.
+  if (/^[=+\-@\t\r]/.test(text)) {
+    text = `'${text}`;
+  }
+
+  if (!/[",\r\n]/.test(text)) {
     return text;
   }
 
@@ -1317,7 +1610,13 @@ function buildOverview(sessions, questionPool) {
 function questionToAdminRow(question) {
   return {
     ...question,
-    answerKey: question.correctOptionIds.join(', '),
+    typeLabel: questionTypeLabel(question),
+    answerKey:
+      question.type === 'single' || question.type === 'multi'
+        ? (question.correctOptionIds ?? [])
+            .map((id) => (question.format && question.format !== 'choice' ? question.options?.find((o) => o.id === id)?.text ?? id : id))
+            .join(', ')
+        : '',
   };
 }
 
@@ -1347,7 +1646,7 @@ function pickExamQuestionSet(exam, questionPool, questionMap) {
   return questionPool.filter((question) => (question.sourceExamId ?? 'general') === exam.id);
 }
 
-function buildQuestionReview(session) {
+function buildQuestionReview(session, { reveal = true } = {}) {
   return (session.questionOrder ?? [])
     .map((questionId, index) => {
       const question = session.questionSnapshot?.[questionId];
@@ -1355,84 +1654,51 @@ function buildQuestionReview(session) {
         return null;
       }
 
-      const selectedOptionIds = session.answers?.[questionId] ?? [];
-      const isCorrect = hasSameOptions(selectedOptionIds, question.correctOptionIds ?? []);
-
       return {
-        index: index + 1,
-        questionId,
-        topic: question.topic,
-        type: question.type,
-        text: question.text,
-        options: question.options ?? [],
-        selectedOptionIds,
-        correctOptionIds: question.correctOptionIds ?? [],
-        isCorrect,
+        ...buildReviewItem(question, session.answers?.[questionId], {
+          reveal,
+          manualGrade: getManualGrade(session, questionId),
+          index: index + 1,
+        }),
+        hintUsed: Boolean(session.hintsUsed?.[questionId]),
       };
     })
     .filter(Boolean);
 }
 
+/** Students see their own answers right away; corrections and explanations after release. */
 function buildStudentQuestionReview(session) {
-  const released = isResultsReleased(session);
-  const baseReview = buildQuestionReview(session);
-  if (released) {
-    return baseReview;
-  }
-
-  return baseReview.map((item) => ({
-    ...item,
-    correctOptionIds: [],
-    isCorrect: null,
-  }));
-}
-
-function formatDateForReport(value) {
-  if (!value) {
-    return '-';
-  }
-
-  try {
-    return new Date(value).toLocaleString();
-  } catch {
-    return '-';
-  }
-}
-
-function formatQuestionSelectedLabel(question, selectedOptionIds = []) {
-  const selected = Array.isArray(selectedOptionIds) ? selectedOptionIds : [];
-  if (!selected.length) {
-    return 'No answer selected';
-  }
-
-  const options = Array.isArray(question?.options) ? question.options : [];
-  return selected
-    .map((optionId) => {
-      const matched = options.find((option) => option.id === optionId);
-      return matched ? `${optionId}. ${matched.text}` : optionId;
-    })
-    .join(' | ');
+  return buildQuestionReview(session, { reveal: isResultsReleased(session) });
 }
 
 function buildReportQuestionRows(session, includeCorrectAnswers) {
-  const rows = buildQuestionReview(session);
+  return (session.questionOrder ?? [])
+    .map((questionId, index) => {
+      const question = session.questionSnapshot?.[questionId];
+      if (!question) {
+        return null;
+      }
 
-  return rows.map((row) => {
-    const question = session.questionSnapshot?.[row.questionId] ?? null;
-    return {
-      index: row.index,
-      text: row.text,
-      selected: formatQuestionSelectedLabel(question, row.selectedOptionIds),
-      correct: includeCorrectAnswers
-        ? formatQuestionSelectedLabel(question, row.correctOptionIds)
-        : 'Locked until review release',
-      result: includeCorrectAnswers
-        ? row.isCorrect
-          ? 'Correct'
-          : 'Incorrect'
-        : 'Locked',
-    };
-  });
+      const response = session.answers?.[questionId];
+      const correct = isQuestionCorrect(session, questionId);
+      const isCode = question.type === 'code';
+      return {
+        index: index + 1,
+        typeLabel: questionTypeLabel(question),
+        text: question.text,
+        code: question.code && !isCode ? question.code : '',
+        selected: describeResponse(question, response) || 'No answer',
+        selectedIsCode: isCode,
+        checks: isCode ? response?.checks ?? null : null,
+        testCount: isCode ? question.tests?.length ?? 0 : 0,
+        correct: includeCorrectAnswers ? describeCorrectAnswer(question) : '',
+        explanation: includeCorrectAnswers ? question.explanation ?? '' : '',
+        result: includeCorrectAnswers ? (correct ? 'Correct' : 'Incorrect') : 'Locked',
+        markedByTeacher: getManualGrade(session, questionId) !== null,
+        hintUsed: Boolean(session.hintsUsed?.[questionId]),
+      };
+    })
+    .filter(Boolean);
 }
 
 function buildReportCardPayload(session, branding, includeCorrectAnswers = false) {
@@ -1442,7 +1708,7 @@ function buildReportCardPayload(session, branding, includeCorrectAnswers = false
   return {
     branding: {
       schoolName: normalizeName(branding?.schoolName) || 'Salem Academy',
-      logoUrl: normalizeName(branding?.logoUrl) || '/favicon.svg',
+      logoUrl: normalizeName(branding?.logoUrl),
     },
     student: {
       fullName: toTitleCaseWords(session.student?.fullName || ''),
@@ -1467,109 +1733,8 @@ function buildReportCardPayload(session, branding, includeCorrectAnswers = false
     totalViolations: session.violations ?? [],
     questions: buildReportQuestionRows(session, includeCorrectAnswers),
     generatedAt: Date.now(),
+    timeZone: APP_TIMEZONE || undefined,
   };
-}
-
-function renderReportCardHtml(payload) {
-  const schoolName = escapeHtml(payload.branding.schoolName);
-  const logoUrl = escapeHtml(payload.branding.logoUrl || '/favicon.svg');
-  const studentName = escapeHtml(payload.student.fullName);
-  const classRoom = escapeHtml(payload.student.classRoom);
-  const examTitle = escapeHtml(payload.exam.title);
-  const sessionId = escapeHtml(payload.exam.sessionId);
-  const summary = payload.summary ?? {};
-  const violationsCount = Number(summary.violationsCount ?? 0);
-  const totalViolationsCount = Number(summary.totalViolationsCount ?? violationsCount);
-  const questionsRowsHtml = payload.questions
-    .map((row) => `
-      <tr>
-        <td>${row.index}</td>
-        <td>${escapeHtml(row.text)}</td>
-        <td>${escapeHtml(row.selected)}</td>
-        <td>${escapeHtml(row.correct)}</td>
-        <td>${escapeHtml(row.result)}</td>
-      </tr>
-    `)
-    .join('');
-
-  return `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Report Card - ${studentName}</title>
-    <style>
-      body { font-family: "Segoe UI", Tahoma, Arial, sans-serif; margin: 24px; color: #1f2937; }
-      .header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
-      .logo { width: 64px; height: 64px; object-fit: contain; border: 1px solid #d1d5db; border-radius: 8px; }
-      .title h1 { margin: 0; font-size: 24px; }
-      .title p { margin: 4px 0 0; color: #4b5563; }
-      .meta { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 8px 20px; margin-bottom: 20px; }
-      .meta div { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 12px; }
-      .summary { display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 10px; margin-bottom: 20px; }
-      .summary div { border: 1px solid #d1d5db; border-radius: 8px; padding: 10px; background: #fff; }
-      .summary strong { display: block; font-size: 20px; margin-top: 4px; }
-      table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-      th, td { border: 1px solid #d1d5db; padding: 8px; font-size: 13px; vertical-align: top; text-align: left; }
-      th { background: #f3f4f6; }
-      .muted { color: #6b7280; font-size: 12px; }
-      .actions { margin-top: 16px; }
-      button { border: 1px solid #111827; border-radius: 6px; background: #111827; color: #fff; padding: 8px 12px; cursor: pointer; }
-      @media print { .actions { display: none; } body { margin: 12px; } }
-    </style>
-  </head>
-  <body>
-    <div class="header">
-      <img class="logo" src="${logoUrl}" alt="School logo" />
-      <div class="title">
-        <h1>${schoolName} Report Card</h1>
-        <p>${examTitle} • Trial #${payload.exam.trialNumber}</p>
-      </div>
-    </div>
-
-    <section class="meta">
-      <div><strong>Student:</strong> ${studentName}</div>
-      <div><strong>Class:</strong> ${classRoom}</div>
-      <div><strong>Contact:</strong> ${escapeHtml(payload.student.contact || '-')}</div>
-      <div><strong>Session ID:</strong> ${sessionId}</div>
-      <div><strong>Submitted:</strong> ${escapeHtml(formatDateForReport(payload.submittedAt))}</div>
-      <div><strong>Started:</strong> ${escapeHtml(formatDateForReport(payload.startedAt))}</div>
-      <div><strong>Generated:</strong> ${escapeHtml(formatDateForReport(payload.generatedAt))}</div>
-    </section>
-
-    <section class="summary">
-      <div><span>Answered</span><strong>${summary.answeredCount ?? 0}/${summary.totalQuestions ?? 0}</strong></div>
-      <div><span>Final Score</span><strong>${summary.finalPercent ?? 0}%</strong></div>
-      <div><span>Raw Score</span><strong>${summary.rawPercent ?? 0}%</strong></div>
-      <div><span>Violations</span><strong>${violationsCount} active / ${totalViolationsCount} total</strong></div>
-    </section>
-
-    <p class="muted">
-      ${payload.includeCorrectAnswers
-        ? 'Correct answers are included in this report.'
-        : `Correct answers are locked until ${escapeHtml(formatDateForReport(payload.resultsAvailableAt))}.`}
-    </p>
-
-    <table>
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Question</th>
-          <th>Your Answer</th>
-          <th>Correct Answer</th>
-          <th>Result</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${questionsRowsHtml || '<tr><td colspan="5">No question review available.</td></tr>'}
-      </tbody>
-    </table>
-
-    <div class="actions">
-      <button type="button" onclick="window.print()">Print / Save PDF</button>
-    </div>
-  </body>
-</html>`;
 }
 
 function buildReportCardFileName(session) {
@@ -1594,8 +1759,46 @@ function sanitizeViolationIds(value) {
   return [...new Set(value.map((id) => normalizeName(id)).filter(Boolean))];
 }
 
-function getViolationPolicy(session, type) {
+const KNOWN_VIOLATION_TYPES = ['tab_switch', 'window_blur', 'fullscreen_exit', 'right_click', 'restricted_key'];
+// A focus loss shorter than this (a system notification, a mis-click on the taskbar) is logged
+// for the teacher but does not cost the student points.
+const BRIEF_FOCUS_LOSS_MS = 2000;
+const MAX_EVIDENCE_DURATION_MS = 6 * 60 * 60 * 1000;
+
+function boundedInt(value, min, max) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : null;
+}
+
+/** Context recorded by the browser with a violation, used as evidence when it is disputed. */
+function sanitizeViolationEvidence(input, session) {
+  const source = isPlainObject(input) ? input : {};
+  const windowStart = Number(session?.startedAt) - 60_000;
+  const windowEnd = Number(session?.expiresAt) + SUBMIT_GRACE_MS + 60_000;
+  const timestamp = (value) => {
+    const number = boundedInt(value, 0, Number.MAX_SAFE_INTEGER);
+    return number !== null && number >= windowStart && number <= windowEnd ? number : null;
+  };
+  const evidence = {
+    durationMs: boundedInt(source.durationMs, 0, MAX_EVIDENCE_DURATION_MS),
+    startedAt: timestamp(source.startedAt),
+    endedAt: timestamp(source.endedAt),
+    questionNumber: boundedInt(source.questionNumber, 0, 1000),
+    remainingSeconds: boundedInt(source.remainingSeconds, 0, 24 * 60 * 60),
+    causes: (Array.isArray(source.causes) ? source.causes : [])
+      .map((cause) => normalizeName(cause).toLowerCase())
+      .filter((cause) => KNOWN_VIOLATION_TYPES.includes(cause))
+      .slice(0, 5),
+    note: normalizeName(source.note).slice(0, 200),
+  };
+  return Object.fromEntries(Object.entries(evidence).filter(([, value]) => value !== null && value !== '' && !(Array.isArray(value) && !value.length)));
+}
+
+function getViolationPolicy(session, type, evidence = {}) {
   const policy = normalizeProctoringPolicy(session?.examProctoring ?? {});
+  if (type === 'window_blur' && Number.isFinite(evidence.durationMs) && evidence.durationMs < BRIEF_FOCUS_LOSS_MS) {
+    return { track: true, deduct: false, policy: 'window_blur:brief' };
+  }
 
   const mapping = {
     tab_switch: {
@@ -1628,10 +1831,11 @@ function getViolationPolicy(session, type) {
   const normalizedType = normalizeName(type).toLowerCase();
   const selected = mapping[normalizedType];
   if (!selected) {
+    // Informational events (for example reopening the exam) are logged but never deduct points.
     return {
       track: true,
-      deduct: true,
-      policy: 'default',
+      deduct: false,
+      policy: 'info',
     };
   }
 
@@ -1639,6 +1843,18 @@ function getViolationPolicy(session, type) {
     track: selected.track !== false,
     deduct: selected.track !== false && selected.deduct !== false,
     policy: selected.track === false ? `${selected.policy}:monitor_only` : selected.policy,
+  };
+}
+
+/** What the student's pre-exam device check reported (shown to the teacher; never blocks). */
+function sanitizeSetupInfo(input) {
+  const source = isPlainObject(input) ? input : {};
+  const camera = ['on', 'unavailable', 'denied'].includes(source.camera) ? source.camera : 'unknown';
+  return {
+    camera,
+    fullscreen: source.fullscreen === true,
+    practiceCompleted: source.practiceCompleted === true,
+    checkedAt: Date.now(),
   };
 }
 
@@ -1656,7 +1872,7 @@ function studentOwnsSession(studentUser, session) {
 function buildExamAttemptStatsForUser(user, exams, sessions) {
   return exams.map((exam) => {
     const trials = sessions.filter(
-      (session) => session.userKey === user.userKey && (session.examId ?? 'general') === exam.id
+      (session) => studentOwnsSession(user, session) && (session.examId ?? 'general') === exam.id
     );
     const submitted = trials.filter((session) => session.submittedAt);
     const bestFinalPercent = submitted.length
@@ -1669,6 +1885,7 @@ function buildExamAttemptStatsForUser(user, exams, sessions) {
 
     return {
       ...toPublicExam(exam),
+      hintsForYou: hintLimitFor(exam, user.classRoom),
       attemptsUsed,
       attemptsRemaining,
       maxAttempts,
@@ -1686,7 +1903,10 @@ function buildStudentLeaderboardRows(sessions) {
       continue;
     }
 
-    const identityKey = session.userKey || session.studentKey || buildStudentKey(session.student, session.examId);
+    // Group by account ID first: an admin renaming a student changes their userKey, and the
+    // student's earlier attempts should stay on the same leaderboard row.
+    const identityKey =
+      session.userId || session.userKey || session.studentKey || buildStudentKey(session.student, session.examId);
     const existing = buckets.get(identityKey) ?? {
       identityKey,
       userId: session.userId ?? null,
@@ -1740,8 +1960,8 @@ function buildStudentLeaderboardRows(sessions) {
     });
 }
 
-function buildStudentLeaderboardPayload(user, sessions) {
-  const rankedOverall = buildStudentLeaderboardRows(sessions).map((entry, index) => ({
+function buildStudentLeaderboardPayload(user, leaderboardRows) {
+  const rankedOverall = leaderboardRows.map((entry, index) => ({
     rank: index + 1,
     studentName: entry.studentName,
     classRoom: entry.classRoom,
@@ -1779,17 +1999,12 @@ function buildStudentLeaderboardPayload(user, sessions) {
   };
 }
 
-function buildStudentDashboardPayload(user, exams, sessions) {
+function buildStudentDashboardPayload(user, exams, trials, leaderboardRows, activeSession) {
   const availableExams = exams.filter(
     (exam) => exam.published && examAllowsClass(exam, user.classRoom)
   );
-  const examStats = buildExamAttemptStatsForUser(user, availableExams, sessions);
-  const leaderboards = buildStudentLeaderboardPayload(user, sessions);
-  const trials = sessions
-    .filter((session) => studentOwnsSession(user, session))
-    .sort((left, right) => right.startedAt - left.startedAt);
-  const activeSession =
-    trials.find((session) => !session.submittedAt && sessionStatus(session) === 'active') ?? null;
+  const examStats = buildExamAttemptStatsForUser(user, availableExams, trials);
+  const leaderboards = buildStudentLeaderboardPayload(user, leaderboardRows);
 
   return {
     user: toPublicUserRecord(user),
@@ -1848,15 +2063,80 @@ function startKeepAliveLoop() {
 }
 
 const app = express();
+app.disable('x-powered-by');
+
+if (TRUST_PROXY) {
+  const numeric = Number(TRUST_PROXY);
+  app.set('trust proxy', Number.isInteger(numeric) ? numeric : TRUST_PROXY === 'true' ? true : TRUST_PROXY);
+}
 
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },
+    contentSecurityPolicy: {
+      directives: {
+        // The school logo is configured as an external URL in Settings.
+        'img-src': ["'self'", 'data:', 'https:'],
+        // The in-browser Python runtime (Pyodide) is WebAssembly served from this site.
+        'script-src': ["'self'", "'wasm-unsafe-eval'"],
+        // Off so the app still loads over plain http://<server-ip> before TLS is set up.
+        // HTTPS is enforced by the reverse proxy (and HSTS) instead.
+        'upgrade-insecure-requests': null,
+      },
+    },
   })
 );
-app.use(cors());
-app.use(express.json({ limit: '100kb' }));
-app.use(express.text({ type: '*/*', limit: '100kb' }));
+app.use(
+  cors(
+    CORS_ORIGINS.length > 0
+      ? {
+          origin(origin, callback) {
+            callback(null, !origin || CORS_ORIGINS.includes(origin));
+          },
+        }
+      : undefined
+  )
+);
+
+const FIFTEEN_MINUTES = 15 * 60 * 1000;
+const ONE_HOUR = 60 * 60 * 1000;
+const adminLoginLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MINUTES,
+  max: 10,
+  count: 'failures',
+  key: (req) => `admin:${clientIp(req)}`,
+  message: 'Too many failed admin login attempts. Wait 15 minutes and try again.',
+});
+const studentLoginLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MINUTES,
+  max: 10,
+  count: 'failures',
+  key: (req) => {
+    const identifier = normalizeName(req.body?.identifier ?? req.body?.email ?? req.body?.username).toLowerCase();
+    return `student:${clientIp(req)}:${identifier}`;
+  },
+  message: 'Too many failed attempts for this account. Wait 15 minutes, or ask your teacher to reset your password.',
+});
+const studentLoginIpLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MINUTES,
+  max: 150,
+  count: 'failures',
+  key: (req) => `student-ip:${clientIp(req)}`,
+});
+const registerLimiter = createRateLimiter({
+  windowMs: ONE_HOUR,
+  max: 200,
+  key: (req) => `register:${clientIp(req)}`,
+  message: 'Too many sign-ups from this network. Please try again later.',
+});
+const passwordHelpLimiter = createRateLimiter({
+  windowMs: ONE_HOUR,
+  max: 40,
+  key: (req) => `help:${clientIp(req)}`,
+  message: 'Too many help requests from this network. Please try again later.',
+});
+app.use(express.json({ limit: '200kb' }));
+app.use(express.text({ type: '*/*', limit: '200kb' }));
 app.use((req, _res, next) => {
   if (typeof req.body !== 'string') {
     next();
@@ -1884,8 +2164,14 @@ app.use((req, _res, next) => {
   next();
 });
 
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, timestamp: new Date().toISOString() });
+app.get('/api/health', async (_req, res) => {
+  const timestamp = new Date().toISOString();
+  try {
+    await (await getDb()).command({ ping: 1 });
+    res.json({ ok: true, db: 'up', timestamp });
+  } catch {
+    res.status(503).json({ ok: false, db: 'down', timestamp });
+  }
 });
 
 app.get('/api/keep-alive', (_req, res) => {
@@ -1897,8 +2183,8 @@ app.get('/api/keep-alive', (_req, res) => {
 });
 
 app.get('/api/exam/meta', async (_req, res) => {
-  const [questionPool, exams, branding] = await Promise.all([
-    getQuestionPool(),
+  const [questionPoolCount, exams, branding] = await Promise.all([
+    getQuestionPoolCount(),
     listExams(),
     getBrandingSettings(),
   ]);
@@ -1907,34 +2193,38 @@ app.get('/api/exam/meta', async (_req, res) => {
   res.json({
     schoolName: branding.schoolName,
     branding,
+    defaultStudentPassword: DEFAULT_STUDENT_PASSWORD,
     durationSeconds: generalExam?.durationSeconds ?? EXAM_DURATION_SECONDS,
     questionCount: generalExam?.questionCount ?? EXAM_QUESTION_COUNT,
-    questionPoolCount: questionPool.length,
+    questionPoolCount,
     classOptions: CLASS_OPTIONS,
     penaltyPerViolation: PENALTY_PER_VIOLATION,
     exams: exams.filter((exam) => exam.published).map((exam) => toPublicExam(exam)),
   });
 });
 
-app.post('/api/student/register', async (req, res) => {
-  const fullName = normalizeName(req.body?.fullName);
+app.post('/api/student/register', registerLimiter, async (req, res) => {
+  const names = readNameParts(req.body);
   const classRoom = normalizeName(req.body?.classRoom);
   const email = normalizeEmail(req.body?.email);
   const username = normalizeUsername(req.body?.username);
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  // Older clients may still choose a password at sign-up; new sign-ups start with the default.
+  const chosenPassword = typeof req.body?.password === 'string' && req.body.password.length >= 4 ? req.body.password : '';
+  const password = chosenPassword || DEFAULT_STUDENT_PASSWORD;
 
-  if (fullName.length < 5) {
-    res.status(400).json({ error: 'Please enter your full name (at least 5 characters).' });
+  const nameError = validateNameParts(names);
+  if (nameError) {
+    res.status(400).json({ error: nameError });
     return;
   }
 
   if (!CLASS_OPTIONS.includes(classRoom)) {
-    res.status(400).json({ error: 'Please choose a valid class.' });
+    res.status(400).json({ error: 'Please choose your class.' });
     return;
   }
 
-  if (!email && !username) {
-    res.status(400).json({ error: 'Provide at least an email or a username.' });
+  if (!username && !email) {
+    res.status(400).json({ error: 'Choose a username.' });
     return;
   }
 
@@ -1945,21 +2235,27 @@ app.post('/api/student/register', async (req, res) => {
 
   if (username && !isValidUsername(username)) {
     res.status(400).json({
-      error: 'Username must be 3-32 characters and use letters, numbers, dot, underscore, or hyphen.',
+      error: 'Usernames are 3 to 32 characters: letters, numbers, dots, underscores or hyphens (no spaces).',
     });
     return;
   }
 
-  if (password.length < 4) {
-    res.status(400).json({ error: 'Password must be at least 4 characters.' });
-    return;
-  }
-
+  const fullName = names.fullName;
   let user;
   try {
-    user = await createUserWithPassword({ fullName, classRoom, email, username }, password, {
-      mustChangePassword: false,
-    });
+    user = await createUserWithPassword(
+      {
+        fullName,
+        firstName: names.firstName,
+        middleName: names.middleName,
+        lastName: names.lastName,
+        classRoom,
+        email,
+        username,
+      },
+      password,
+      { mustChangePassword: !chosenPassword }
+    );
   } catch (error) {
     if (error?.code === 'EMAIL_ALREADY_EXISTS') {
       res.status(409).json({ error: 'An account with this email already exists. Please login instead.' });
@@ -1967,7 +2263,9 @@ app.post('/api/student/register', async (req, res) => {
     }
 
     if (error?.code === 'USERNAME_ALREADY_EXISTS') {
-      res.status(409).json({ error: 'An account with this username already exists. Please login instead.' });
+      res.status(409).json({
+        error: 'That username is already taken. If it is yours, sign in instead; otherwise choose another one.',
+      });
       return;
     }
 
@@ -1981,14 +2279,9 @@ app.post('/api/student/register', async (req, res) => {
   }
 
   await touchUserLogin(user.id);
-  const refreshedUser = (await getUserById(user.id)) ?? user;
+  const refreshedUser = { ...user, lastLoginAt: Date.now() };
   const tokenInfo = await issueStudentToken(refreshedUser);
-  const [exams, sessions, generalFeedbackHistory] = await Promise.all([
-    listExams(),
-    getLatestSessions(),
-    listGeneralFeedbackByUser(refreshedUser.id, 8),
-  ]);
-  const dashboard = buildStudentDashboardPayload(refreshedUser, exams, sessions);
+  const dashboard = await loadStudentDashboard(refreshedUser);
 
   res.setHeader('Cache-Control', 'no-store');
   res.status(201).json({
@@ -1996,17 +2289,16 @@ app.post('/api/student/register', async (req, res) => {
     token: tokenInfo.token,
     expiresAt: tokenInfo.expiresAt,
     tokenLifetimeMs: STUDENT_TOKEN_LIFETIME_MS,
-    generalFeedbackHistory,
     ...dashboard,
   });
 });
 
-app.post('/api/student/login', async (req, res) => {
+app.post('/api/student/login', studentLoginIpLimiter, studentLoginLimiter, async (req, res) => {
   const identifier = normalizeName(req.body?.identifier ?? req.body?.email ?? req.body?.username);
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
 
   if (!identifier) {
-    res.status(400).json({ error: 'Enter your email or username.' });
+    res.status(400).json({ error: 'Enter your username.' });
     return;
   }
 
@@ -2025,14 +2317,14 @@ app.post('/api/student/login', async (req, res) => {
     return;
   }
 
-  if (password.length < 3) {
+  if (!password) {
     res.status(400).json({ error: 'Please enter your password.' });
     return;
   }
 
   const user = looksLikeEmail ? await getUserByEmail(asEmail) : await getUserByUsername(asUsername);
   if (!user) {
-    res.status(404).json({ error: 'No account found for this email/username. Please register first.' });
+    res.status(404).json({ error: 'No account found with that username. Check the spelling, or register first.' });
     return;
   }
 
@@ -2041,20 +2333,15 @@ app.post('/api/student/login', async (req, res) => {
     return;
   }
 
-  if (!verifyPasswordScrypt(password, user.passwordHash)) {
-    res.status(401).json({ error: 'Invalid password.' });
+  if (!(await verifyPasswordScryptAsync(password, user.passwordHash))) {
+    res.status(401).json({ error: 'That password is not right. Try again, or ask your teacher to reset it.' });
     return;
   }
 
   await touchUserLogin(user.id);
-  const refreshedUser = (await getUserById(user.id)) ?? user;
+  const refreshedUser = { ...user, lastLoginAt: Date.now() };
   const tokenInfo = await issueStudentToken(refreshedUser);
-  const [exams, sessions, generalFeedbackHistory] = await Promise.all([
-    listExams(),
-    getLatestSessions(),
-    listGeneralFeedbackByUser(refreshedUser.id, 8),
-  ]);
-  const dashboard = buildStudentDashboardPayload(refreshedUser, exams, sessions);
+  const dashboard = await loadStudentDashboard(refreshedUser);
 
   res.setHeader('Cache-Control', 'no-store');
   res.json({
@@ -2062,52 +2349,61 @@ app.post('/api/student/login', async (req, res) => {
     token: tokenInfo.token,
     expiresAt: tokenInfo.expiresAt,
     tokenLifetimeMs: STUDENT_TOKEN_LIFETIME_MS,
-    generalFeedbackHistory,
     ...dashboard,
   });
 });
 
 app.get('/api/student/me', requireStudent, async (req, res) => {
-  const [exams, sessions, generalFeedbackHistory] = await Promise.all([
-    listExams(),
-    getLatestSessions(),
-    listGeneralFeedbackByUser(req.student.user.id, 8),
-  ]);
-  const dashboard = buildStudentDashboardPayload(req.student.user, exams, sessions);
+  const dashboard = await loadStudentDashboard(req.student.user);
 
   res.setHeader('Cache-Control', 'no-store');
   res.json({
     ok: true,
-    generalFeedbackHistory,
     ...dashboard,
   });
+});
+
+// Revokes the token server-side, so a student on a shared lab computer is really signed out.
+app.post('/api/student/logout', requireStudent, async (req, res) => {
+  await deleteStudentToken(req.student.token.token);
+  res.json({ ok: true });
 });
 
 app.post('/api/student/change-password', requireStudent, async (req, res) => {
   const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
   const nextPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
 
-  if (!currentPassword || !nextPassword) {
-    res.status(400).json({ error: 'Current password and new password are required.' });
-    return;
-  }
+  // Right after sign-up or a teacher reset, the student just signed in with the starting
+  // password, so they are not asked for it again.
+  const isRequiredChange = Boolean(req.student.user.mustChangePassword);
 
   if (nextPassword.length < 4) {
-    res.status(400).json({ error: 'New password must be at least 4 characters.' });
+    res.status(400).json({ error: 'Your new password must be at least 4 characters.' });
     return;
   }
 
-  if (!verifyPasswordScrypt(currentPassword, req.student.user.passwordHash)) {
-    res.status(401).json({ error: 'Current password is incorrect.' });
+  if (isRequiredChange && nextPassword.trim().toLowerCase() === DEFAULT_STUDENT_PASSWORD.toLowerCase()) {
+    res.status(400).json({ error: 'Choose a password that is different from the starting password.' });
     return;
   }
 
-  if (currentPassword === nextPassword) {
-    res.status(400).json({ error: 'New password must be different from current password.' });
-    return;
+  if (!isRequiredChange) {
+    if (!currentPassword) {
+      res.status(400).json({ error: 'Enter your current password.' });
+      return;
+    }
+    // 403, not 401: a wrong current password must not sign the student out.
+    if (!(await verifyPasswordScryptAsync(currentPassword, req.student.user.passwordHash))) {
+      res.status(403).json({ error: 'Your current password is not right.' });
+      return;
+    }
+    if (currentPassword === nextPassword) {
+      res.status(400).json({ error: 'Your new password must be different from your current one.' });
+      return;
+    }
   }
 
-  const nextHash = hashPasswordScrypt(nextPassword);
+  const nextHash = await hashPasswordScryptAsync(nextPassword);
   const updated = await updateUserPassword(req.student.user.id, nextHash, {
     mustChangePassword: false,
   });
@@ -2149,15 +2445,16 @@ app.post('/api/student/feedback', requireStudent, async (req, res) => {
   });
 });
 
-app.post('/api/student/password-help', async (req, res) => {
-  const fullName = normalizeName(req.body?.fullName);
+app.post('/api/student/password-help', passwordHelpLimiter, async (req, res) => {
+  const names = readNameParts(req.body);
+  const fullName = names.fullName;
   const classRoom = normalizeName(req.body?.classRoom);
   const email = normalizeEmail(req.body?.email);
   const username = normalizeUsername(req.body?.username);
   const message = normalizeName(req.body?.message ?? '');
 
-  if (fullName.length < 5) {
-    res.status(400).json({ error: 'Please enter your full name.' });
+  if (names.firstName.length < 2 || names.lastName.length < 2) {
+    res.status(400).json({ error: 'Enter your first and last name.' });
     return;
   }
 
@@ -2167,7 +2464,7 @@ app.post('/api/student/password-help', async (req, res) => {
   }
 
   if (!email && !username) {
-    res.status(400).json({ error: 'Provide at least an email or username for contact.' });
+    res.status(400).json({ error: 'Enter your username.' });
     return;
   }
 
@@ -2177,9 +2474,7 @@ app.post('/api/student/password-help', async (req, res) => {
   }
 
   if (username && !isValidUsername(username)) {
-    res.status(400).json({
-      error: 'Username must be 3-32 characters and use letters, numbers, dot, underscore, or hyphen.',
-    });
+    res.status(400).json({ error: 'Check your username: 3 to 32 letters or numbers, no spaces.' });
     return;
   }
 
@@ -2199,11 +2494,7 @@ app.post('/api/student/password-help', async (req, res) => {
 });
 
 app.get('/api/student/trials', requireStudent, async (req, res) => {
-  const sessions = await getLatestSessions();
-  const trials = sessions
-    .filter((session) => studentOwnsSession(req.student.user, session))
-    .sort((left, right) => right.startedAt - left.startedAt)
-    .map(toStudentTrialRow);
+  const trials = (await loadStudentTrials(req.student.user)).map(toStudentTrialRow);
 
   res.setHeader('Cache-Control', 'no-store');
   res.json({
@@ -2251,6 +2542,12 @@ app.get('/api/student/trials/:sessionId/report-card', requireStudent, async (req
     return;
   }
 
+  // SECURITY: a report card scores the session, so it is only available once submitted.
+  if (!trial.submittedAt) {
+    res.status(409).json({ error: 'The report card is available after the exam is submitted.' });
+    return;
+  }
+
   const branding = await getBrandingSettings();
   const includeCorrectAnswers = isResultsReleased(trial);
   const payload = buildReportCardPayload(trial, branding, includeCorrectAnswers);
@@ -2262,6 +2559,10 @@ app.get('/api/student/trials/:sessionId/report-card', requireStudent, async (req
 });
 
 app.post('/api/exam/start', requireStudent, async (req, res) => {
+  await withExamStartLock(req.student.user.id, () => startExamForStudent(req, res));
+});
+
+async function startExamForStudent(req, res) {
   const requestedExamId = normalizeExamId(req.body?.examId) || 'general';
   const user = req.student.user;
   const fullName = user.fullName;
@@ -2269,12 +2570,12 @@ app.post('/api/exam/start', requireStudent, async (req, res) => {
   const email = user.email;
   const username = normalizeUsername(user.username ?? '');
 
-  const [selectedExam, questionPool, questionMap, sessions] = await Promise.all([
+  const [selectedExam, questionPool, studentTrials] = await Promise.all([
     getExam(requestedExamId),
     getQuestionPool(),
-    getQuestionByIdMap(),
-    getLatestSessions(),
+    loadStudentTrials(user),
   ]);
+  const questionMap = new Map(questionPool.map((question) => [question.id, question]));
 
   if (!selectedExam || !selectedExam.published) {
     res.status(404).json({ error: 'Selected exam is not available.' });
@@ -2296,9 +2597,7 @@ app.post('/api/exam/start', requireStudent, async (req, res) => {
     return;
   }
 
-  const existingTrials = sessions.filter(
-    (session) => studentOwnsSession(user, session) && (session.examId ?? 'general') === selectedExam.id
-  );
+  const existingTrials = studentTrials.filter((session) => (session.examId ?? 'general') === selectedExam.id);
   const activeTrial = existingTrials.find(
     (session) => !session.submittedAt && sessionStatus(session) === 'active'
   );
@@ -2306,12 +2605,13 @@ app.post('/api/exam/start', requireStudent, async (req, res) => {
   const attemptsUsed = existingTrials.length;
   const attemptsRemaining = Math.max(0, maxAttempts - attemptsUsed);
   if (activeTrial) {
+    const fullActiveTrial = (await getLatestSession(activeTrial.id)) ?? activeTrial;
     res.status(409).json({
       error: 'You already have an active trial for this exam.',
       attemptsUsed,
       maxAttempts,
       attemptsRemaining,
-      session: toStudentClientSession(activeTrial),
+      session: toStudentClientSession(fullActiveTrial),
     });
     return;
   }
@@ -2326,9 +2626,14 @@ app.post('/api/exam/start', requireStudent, async (req, res) => {
     return;
   }
 
+  // Random selection and order per student, but grouped so quick questions come first and the
+  // Python program comes last (a student should not meet the longest question first).
   const servedQuestions = shuffleArray(examQuestionPool)
     .slice(0, requiredQuestionCount)
-    .map(shuffleQuestionOptions);
+    .map(prepareQuestionForSession)
+    .map((question, position) => ({ question, position, rank: sectionRank(question) }))
+    .sort((left, right) => left.rank - right.rank || left.position - right.position)
+    .map((entry) => entry.question);
   const startedAt = Date.now();
   const studentKey = buildStudentKey(
     {
@@ -2339,7 +2644,8 @@ app.post('/api/exam/start', requireStudent, async (req, res) => {
     },
     selectedExam.id
   );
-  const trialNumber = existingTrials.length + 1;
+  // max+1 rather than count+1 keeps attempt numbers unique after an admin deletes an attempt.
+  const trialNumber = existingTrials.reduce((max, session) => Math.max(max, Number(session.trialNumber) || 0), 0) + 1;
   const session = {
     id: randomUUID(),
     examId: selectedExam.id,
@@ -2368,16 +2674,20 @@ app.post('/api/exam/start', requireStudent, async (req, res) => {
     submittedAt: null,
     summary: null,
     feedback: null,
+    lastActivityAt: startedAt,
+    setup: sanitizeSetupInfo(req.body?.setup),
+    hintLimit: hintLimitFor(selectedExam, classRoom),
+    hintsUsed: {},
   };
 
-  await saveSession(session);
+  const created = await insertSession(session);
   res.status(201).json({
-    ...toStudentClientSession(session),
-    attemptsUsed: trialNumber,
+    ...toStudentClientSession(created),
+    attemptsUsed: attemptsUsed + 1,
     maxAttempts,
-    attemptsRemaining: Math.max(0, maxAttempts - trialNumber),
+    attemptsRemaining: Math.max(0, maxAttempts - attemptsUsed - 1),
   });
-});
+}
 
 app.get('/api/exam/:sessionId', requireStudent, async (req, res) => {
   const session = await getLatestSession(req.params.sessionId);
@@ -2479,7 +2789,7 @@ app.post('/api/exam/:sessionId/answer', requireStudent, async (req, res) => {
     return;
   }
 
-  const selected = sanitizeSelectedOptions(question, req.body?.selectedOptionIds);
+  const selected = sanitizeResponse(question, req.body?.response ?? req.body?.selectedOptionIds) ?? [];
 
   const updated = await applyActiveSessionUpdateOrError(sessionId, res, req.student.user, (current) => ({
     ...current,
@@ -2491,12 +2801,100 @@ app.post('/api/exam/:sessionId/answer', requireStudent, async (req, res) => {
       ...current.answers,
       [questionId]: selected,
     },
+    lastActivityAt: Date.now(),
   }));
   if (!updated) {
     return;
   }
 
   res.json({ ok: true, responses: updated?.answers ?? session.answers });
+});
+
+// Reveals the hint for one question, spending one of the student's hints. Asking again for a
+// question whose hint is already revealed is free.
+app.post('/api/exam/:sessionId/hint', requireStudent, async (req, res) => {
+  const sessionId = req.params.sessionId;
+  let outcome = null;
+
+  const updated = await applyActiveSessionUpdateOrError(sessionId, res, req.student.user, (current) => {
+    const questionId = resolveSessionQuestionId(current, req.body?.questionId, null);
+    const hint = questionId ? resolveQuestionFromSnapshot(current, questionId)?.hint : '';
+    const used = current.hintsUsed ?? {};
+    const limit = Number(current.hintLimit) || 0;
+    if (!hint) {
+      outcome = { status: 404, error: 'There is no hint for this question.' };
+      return current;
+    }
+    if (used[questionId]) {
+      outcome = { questionId, hint };
+      return current;
+    }
+    if (Object.keys(used).length >= limit) {
+      outcome = { status: 409, error: limit ? 'You have used all your hints.' : 'Hints are not available for this exam.' };
+      return current;
+    }
+    outcome = { questionId, hint };
+    return { ...current, hintsUsed: { ...used, [questionId]: Date.now() }, lastActivityAt: Date.now() };
+  });
+  if (!updated) {
+    return;
+  }
+  if (outcome?.status) {
+    res.status(outcome.status).json({ error: outcome.error });
+    return;
+  }
+
+  res.json({ ok: true, questionId: outcome.questionId, hint: outcome.hint, hints: buildClientHints(updated) });
+});
+
+/** Merges a { questionId: answer } map into a session's answers (unknown questions are skipped). */
+function applyAnswerBatch(current, answersInput) {
+  const applied = [];
+  const rejected = [];
+  const nextAnswers = { ...(current.answers ?? {}) };
+
+  for (const [requestedId, value] of Object.entries(answersInput ?? {}).slice(0, 200)) {
+    const questionId = resolveSessionQuestionId(current, requestedId, null);
+    const question = questionId ? resolveQuestionFromSnapshot(current, questionId) : null;
+    const response = question ? sanitizeResponse(question, value) : null;
+    if (!question || response === null) {
+      rejected.push(requestedId);
+      continue;
+    }
+    nextAnswers[questionId] = response;
+    applied.push(requestedId);
+  }
+
+  return { nextAnswers, applied, rejected };
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Saves several answers in one write. The browser queues answers locally and sends whatever is
+// pending here, retrying until the server confirms, so a dropped connection never loses work.
+app.post('/api/exam/:sessionId/answers', requireStudent, async (req, res) => {
+  const sessionId = req.params.sessionId;
+  const input = req.body?.answers;
+  if (!isPlainObject(input)) {
+    res.status(400).json({ error: 'Provide answers as { questionId: answer }.' });
+    return;
+  }
+
+  let batch = { applied: [], rejected: [] };
+  const updated = await applyActiveSessionUpdateOrError(sessionId, res, req.student.user, (current) => {
+    batch = applyAnswerBatch(current, input);
+    if (!batch.applied.length) {
+      return current;
+    }
+    return { ...current, answers: batch.nextAnswers, lastActivityAt: Date.now() };
+  });
+  if (!updated) {
+    return;
+  }
+
+  res.json({ ok: true, applied: batch.applied, rejected: batch.rejected, savedAt: Date.now() });
 });
 
 app.post('/api/exam/:sessionId/flag', requireStudent, async (req, res) => {
@@ -2557,7 +2955,13 @@ app.post('/api/exam/:sessionId/proctor', requireStudent, async (req, res) => {
     return;
   }
 
-  const violationPolicy = getViolationPolicy(session, type);
+  const evidence = sanitizeViolationEvidence(req.body?.evidence, session);
+  if (type === 'exam_reopened') {
+    // How long the exam was closed: from the last thing the server heard until now.
+    const lastSeen = Number(session.lastActivityAt) || Number(session.startedAt) || Date.now();
+    evidence.durationMs = Math.max(0, Date.now() - lastSeen);
+  }
+  const violationPolicy = getViolationPolicy(session, type, evidence);
   const violation = {
     id: randomUUID(),
     type: type.slice(0, 80),
@@ -2567,11 +2971,13 @@ app.post('/api/exam/:sessionId/proctor', requireStudent, async (req, res) => {
     deduct: violationPolicy.deduct,
     policy: violationPolicy.policy,
     waivedAt: null,
+    evidence,
   };
 
   const updated = await applyActiveSessionUpdateOrError(sessionId, res, req.student.user, (current) => ({
     ...current,
     violations: [...current.violations, violation],
+    lastActivityAt: Date.now(),
   }));
   if (!updated) {
     return;
@@ -2586,15 +2992,17 @@ app.post('/api/exam/:sessionId/proctor', requireStudent, async (req, res) => {
 
 app.post('/api/exam/:sessionId/submit', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
-  const finalized = await applyActiveSessionUpdateOrError(
-    sessionId,
-    res,
-    req.student.user,
-    (current) => finalizeSession(current)
+  // The browser sends any answers it has not confirmed yet with the submission itself, so the
+  // last few answers are saved and marked in the same write.
+  const finalAnswers = isPlainObject(req.body?.answers) ? req.body.answers : null;
+  const finalized = await applyActiveSessionUpdateOrError(sessionId, res, req.student.user, (current) =>
+    finalizeSession(finalAnswers ? { ...current, answers: applyAnswerBatch(current, finalAnswers).nextAnswers } : current)
   );
   if (!finalized) {
     return;
   }
+
+  invalidateLeaderboardCache();
 
   res.json({
     ok: true,
@@ -2605,7 +3013,7 @@ app.post('/api/exam/:sessionId/submit', requireStudent, async (req, res) => {
 
 app.post('/api/exam/:sessionId/feedback', requireStudent, async (req, res) => {
   const sessionId = req.params.sessionId;
-  let latest = await getLatestSession(sessionId);
+  const latest = await getLatestSession(sessionId);
 
   if (!latest) {
     res.status(404).json({ error: 'Session not found.' });
@@ -2617,17 +3025,12 @@ app.post('/api/exam/:sessionId/feedback', requireStudent, async (req, res) => {
     return;
   }
 
-  if (!latest.submittedAt) {
-    if (Date.now() >= Number(latest.expiresAt)) {
-      latest = finalizeSession(latest);
-      await saveSession(latest);
-    } else {
-      res.status(409).json({
-        error: 'Feedback can only be sent after submitting the exam.',
-        session: toStudentClientSession(latest),
-      });
-      return;
-    }
+  if (!latest.submittedAt && !isPastGrace(latest)) {
+    res.status(409).json({
+      error: 'Feedback can only be sent after submitting the exam.',
+      session: toStudentClientSession(latest),
+    });
+    return;
   }
 
   const feedback = sanitizeFeedbackPayload(req.body ?? {});
@@ -2636,11 +3039,14 @@ app.post('/api/exam/:sessionId/feedback', requireStudent, async (req, res) => {
     return;
   }
 
-  const updated = {
-    ...latest,
+  const updated = await updateSession(sessionId, (current) => ({
+    ...(current.submittedAt ? current : finalizeSession(current)),
     feedback,
-  };
-  await saveSession(updated);
+  }));
+  if (!updated) {
+    res.status(404).json({ error: 'Session not found.' });
+    return;
+  }
 
   res.json({
     ok: true,
@@ -2649,7 +3055,7 @@ app.post('/api/exam/:sessionId/feedback', requireStudent, async (req, res) => {
   });
 });
 
-app.post('/api/admin/login', async (req, res) => {
+app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
   if (!parsedAdminPasscodeHash) {
     res.status(503).json({
       error: 'Admin authentication hash is missing. Set ADMIN_PASSCODE_HASH in your environment.',
@@ -2658,7 +3064,7 @@ app.post('/api/admin/login', async (req, res) => {
   }
 
   const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode : '';
-  if (!verifyAdminPasscode(passcode)) {
+  if (!(await verifyAdminPasscode(passcode))) {
     res.status(401).json({ error: 'Invalid admin passcode.' });
     return;
   }
@@ -2671,6 +3077,11 @@ app.post('/api/admin/login', async (req, res) => {
     expiresAt: tokenInfo.expiresAt,
     tokenLifetimeMs: ADMIN_TOKEN_LIFETIME_MS,
   });
+});
+
+app.post('/api/admin/logout', requireAdmin, async (req, res) => {
+  await deleteAdminToken(req.admin.token);
+  res.json({ ok: true });
 });
 
 app.get('/api/admin/settings/branding', requireAdmin, async (_req, res) => {
@@ -2697,7 +3108,7 @@ app.patch('/api/admin/settings/branding', requireAdmin, async (req, res) => {
 
 app.get('/api/admin/overview', requireAdmin, async (_req, res) => {
   const [sessions, questionPool, generalFeedbackCount] = await Promise.all([
-    getLatestSessions(),
+    loadSessionList(),
     getQuestionPool(),
     countGeneralFeedback(),
   ]);
@@ -2718,7 +3129,7 @@ app.get('/api/admin/sessions', requireAdmin, async (req, res) => {
   const statusFilter = normalizeName(req.query?.status ?? '').toLowerCase();
   const examIdFilter = normalizeExamId(req.query?.examId ?? '');
 
-  const sessions = await getLatestSessions();
+  const sessions = await loadSessionList();
 
   const filtered = sessions.filter((session) => {
     const sessionRow = toSessionRow(session);
@@ -2870,6 +3281,7 @@ app.patch('/api/admin/sessions/:sessionId/violations/waive', requireAdmin, async
     return;
   }
 
+  invalidateLeaderboardCache();
   const normalized = await getLatestSession(sessionId);
   res.json({
     ok: true,
@@ -2887,6 +3299,7 @@ app.delete('/api/admin/sessions/:sessionId', requireAdmin, async (req, res) => {
     return;
   }
 
+  invalidateLeaderboardCache();
   res.json({ ok: true, deletedCount: 1 });
 });
 
@@ -2898,6 +3311,7 @@ app.delete('/api/admin/sessions', requireAdmin, async (req, res) => {
   }
 
   const deletedCount = await deleteSessions(sessionIds);
+  invalidateLeaderboardCache();
   res.json({
     ok: true,
     deletedCount,
@@ -2914,6 +3328,7 @@ app.post('/api/admin/sessions/delete-selected', requireAdmin, async (req, res) =
   }
 
   const deletedCount = await deleteSessions(sessionIds);
+  invalidateLeaderboardCache();
   res.json({
     ok: true,
     deletedCount,
@@ -2928,7 +3343,7 @@ app.post('/api/admin/sessions/purge', requireAdmin, async (req, res) => {
     return;
   }
 
-  const sessions = await getLatestSessions();
+  const sessions = await loadSessionList();
   const targetIds = sessions
     .filter((session) => {
       if (scope === 'all') {
@@ -2939,6 +3354,7 @@ app.post('/api/admin/sessions/purge', requireAdmin, async (req, res) => {
     .map((session) => session.id);
 
   const deletedCount = await deleteSessions(targetIds);
+  invalidateLeaderboardCache();
   res.json({
     ok: true,
     deletedCount,
@@ -2946,12 +3362,272 @@ app.post('/api/admin/sessions/purge', requireAdmin, async (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------- violation disputes
+
+const DISPUTE_REASONS = ['accident', 'not_me', 'other'];
+
+// A student may dispute a violation after submitting (so it never costs exam time).
+app.post('/api/student/trials/:sessionId/violations/:violationId/dispute', requireStudent, async (req, res) => {
+  const { sessionId, violationId } = req.params;
+  const reason = DISPUTE_REASONS.includes(req.body?.reason) ? req.body.reason : '';
+  const note = normalizeName(req.body?.note ?? '').slice(0, 400);
+  if (!reason) {
+    res.status(400).json({ error: 'Choose a reason for your dispute.' });
+    return;
+  }
+
+  let problem = null;
+  const updated = await updateSession(sessionId, (current) => {
+    problem = null;
+    if (!studentOwnsSession(req.student.user, current)) {
+      problem = { status: 403, error: 'You do not have access to this attempt.' };
+      return current;
+    }
+    if (!current.submittedAt) {
+      problem = { status: 409, error: 'You can dispute violations after you submit the exam.' };
+      return current;
+    }
+    const violation = (current.violations ?? []).find((item) => item.id === violationId);
+    if (!violation) {
+      problem = { status: 404, error: 'Violation not found.' };
+      return current;
+    }
+    if (violation.dispute) {
+      problem = { status: 409, error: 'You have already disputed this violation.' };
+      return current;
+    }
+    return {
+      ...current,
+      violations: current.violations.map((item) =>
+        item.id === violationId ? { ...item, dispute: { status: 'open', reason, note, submittedAt: Date.now() } } : item
+      ),
+    };
+  });
+
+  if (!updated) {
+    res.status(404).json({ error: 'Attempt not found.' });
+    return;
+  }
+  if (problem) {
+    res.status(problem.status).json({ error: problem.error });
+    return;
+  }
+
+  res.status(201).json({ ok: true, violations: updated.violations ?? [] });
+});
+
+app.get('/api/admin/disputes', requireAdmin, async (req, res) => {
+  const status = normalizeName(req.query?.status ?? 'open').toLowerCase();
+  const sessions = await loadSessionList({ 'violations.dispute.status': { $exists: true } });
+  const disputes = [];
+  for (const session of sessions) {
+    for (const violation of session.violations ?? []) {
+      if (!violation.dispute) continue;
+      const isOpen = violation.dispute.status === 'open';
+      if ((status === 'open' && !isOpen) || (status === 'resolved' && isOpen)) continue;
+      disputes.push({
+        sessionId: session.id,
+        violationId: violation.id,
+        studentName: session.student?.fullName ?? 'Unknown',
+        classRoom: session.student?.classRoom ?? '',
+        examTitle: session.examTitle,
+        trialNumber: session.trialNumber,
+        type: violation.type,
+        detail: violation.detail,
+        occurredAt: violation.occurredAt,
+        deduct: violation.deduct !== false,
+        waived: Boolean(violation.waived),
+        evidence: violation.evidence ?? {},
+        dispute: violation.dispute,
+        finalPercent: session.summary?.finalPercent ?? null,
+        totalViolations: (session.violations ?? []).length,
+      });
+    }
+  }
+  disputes.sort((left, right) => (right.dispute.submittedAt ?? 0) - (left.dispute.submittedAt ?? 0));
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, total: disputes.length, disputes });
+});
+
+// Accepting a dispute waives the violation (the score is recalculated); rejecting keeps it.
+app.patch('/api/admin/sessions/:sessionId/violations/:violationId/dispute', requireAdmin, async (req, res) => {
+  const { sessionId, violationId } = req.params;
+  const decision = req.body?.decision === 'accept' ? 'accepted' : req.body?.decision === 'reject' ? 'rejected' : '';
+  if (!decision) {
+    res.status(400).json({ error: 'Decision must be "accept" or "reject".' });
+    return;
+  }
+  const adminNote = normalizeName(req.body?.adminNote ?? '').slice(0, 400);
+  const now = Date.now();
+  let found = false;
+
+  const updated = await updateSession(sessionId, (current) => {
+    found = false;
+    const violations = (current.violations ?? []).map((item) => {
+      if (item.id !== violationId || !item.dispute) return item;
+      found = true;
+      return {
+        ...item,
+        waived: decision === 'accepted' ? true : item.waived,
+        waivedAt: decision === 'accepted' ? now : item.waivedAt ?? null,
+        dispute: { ...item.dispute, status: decision, adminNote, resolvedAt: now },
+      };
+    });
+    if (!found) return current;
+    const next = { ...current, violations };
+    if (next.submittedAt) next.summary = evaluateSession(next);
+    return next;
+  });
+
+  if (!updated || !found) {
+    res.status(404).json({ error: 'Dispute not found.' });
+    return;
+  }
+
+  invalidateLeaderboardCache();
+  res.json({ ok: true, decision, summary: updated.summary ?? null });
+});
+
+// ---------------------------------------------------------------- teacher mark overrides
+
+// Lets the teacher overrule the automatic mark for one question (most useful for the Python
+// program, which is checked in the student's browser). `correct: null` restores the automatic mark.
+app.patch('/api/admin/sessions/:sessionId/grades', requireAdmin, async (req, res) => {
+  const sessionId = req.params.sessionId;
+  const requestedId = normalizeName(req.body?.questionId);
+  const correct = req.body?.correct === true ? true : req.body?.correct === false ? false : null;
+  let found = false;
+
+  const updated = await updateSession(sessionId, (current) => {
+    const questionId = resolveSessionQuestionId(current, requestedId, null);
+    found = Boolean(questionId);
+    if (!questionId) return current;
+    const manualGrades = { ...(current.manualGrades ?? {}) };
+    if (correct === null) delete manualGrades[questionId];
+    else manualGrades[questionId] = correct;
+    const next = { ...current, manualGrades };
+    if (next.submittedAt) next.summary = evaluateSession(next);
+    return next;
+  });
+
+  if (!updated || !found) {
+    res.status(404).json({ error: 'Attempt or question not found.' });
+    return;
+  }
+
+  invalidateLeaderboardCache();
+  res.json({ ok: true, summary: updated.summary ?? null });
+});
+
+// ---------------------------------------------------------------- bulk printing
+
+const MAX_BULK_REPORT_CARDS = 250;
+
+/** Submitted attempts chosen by id list or by exam/class filters, one or all per student. */
+async function selectSubmittedSessions(body) {
+  const ids = parseSessionIdsInput(body?.sessionIds).slice(0, 1000);
+  const examId = normalizeExamId(body?.examId ?? '');
+  const classRoom = normalizeName(body?.classRoom ?? '');
+  const attempt = ['best', 'latest', 'all'].includes(body?.attempt) ? body.attempt : 'all';
+
+  const filter = ids.length ? { id: { $in: ids } } : {};
+  let sessions = (await loadSessionList(filter)).filter((session) => session.submittedAt);
+  if (!ids.length) {
+    if (examId) sessions = sessions.filter((session) => (session.examId ?? 'general') === examId);
+    if (classRoom) sessions = sessions.filter((session) => session.student?.classRoom === classRoom);
+  }
+
+  if (attempt !== 'all') {
+    const chosen = new Map();
+    for (const session of sessions) {
+      const key = `${session.userId || session.userKey || session.studentKey}|${session.examId}`;
+      const existing = chosen.get(key);
+      const better =
+        !existing ||
+        (attempt === 'best'
+          ? (session.summary?.finalPercent ?? 0) > (existing.summary?.finalPercent ?? 0)
+          : (session.submittedAt ?? 0) > (existing.submittedAt ?? 0));
+      if (better) chosen.set(key, session);
+    }
+    sessions = [...chosen.values()];
+  }
+
+  return sessions.sort(
+    (left, right) =>
+      String(left.student?.classRoom).localeCompare(String(right.student?.classRoom)) ||
+      String(left.student?.fullName).localeCompare(String(right.student?.fullName)) ||
+      (left.trialNumber ?? 1) - (right.trialNumber ?? 1)
+  );
+}
+
+// One printable document with a full report card (answers, corrections, explanations) per attempt.
+app.post('/api/admin/report-cards', requireAdmin, async (req, res) => {
+  const selected = await selectSubmittedSessions(req.body ?? {});
+  if (!selected.length) {
+    res.status(404).json({ error: 'No submitted attempts match that selection.' });
+    return;
+  }
+  if (selected.length > MAX_BULK_REPORT_CARDS) {
+    res.status(400).json({
+      error: `That is ${selected.length} report cards. Print up to ${MAX_BULK_REPORT_CARDS} at a time: filter by class, or choose one attempt per student.`,
+    });
+    return;
+  }
+
+  const branding = await getBrandingSettings();
+  const payloads = [];
+  // Full attempts (with questions) are loaded a few at a time to keep memory flat.
+  for (let index = 0; index < selected.length; index += 10) {
+    const chunk = await Promise.all(selected.slice(index, index + 10).map((session) => getLatestSession(session.id)));
+    for (const session of chunk) {
+      if (session?.submittedAt) payloads.push(buildReportCardPayload(session, branding, true));
+    }
+  }
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="report-cards.html"');
+  res.send(renderBulkReportCardsHtml(payloads, `${branding.schoolName} report cards`));
+});
+
+// A compact class list: one row per student result.
+app.post('/api/admin/result-sheet', requireAdmin, async (req, res) => {
+  const selected = await selectSubmittedSessions(req.body ?? {});
+  const branding = await getBrandingSettings();
+  const classRoom = normalizeName(req.body?.classRoom ?? '');
+  const examId = normalizeExamId(req.body?.examId ?? '');
+  const exam = examId ? await getExam(examId) : null;
+  const attemptLabel = { best: 'best attempt per student', latest: 'latest attempt per student' }[req.body?.attempt] ?? 'all attempts';
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="result-sheet.html"');
+  res.send(
+    renderResultSheetHtml({
+      branding: { schoolName: branding.schoolName, logoUrl: branding.logoUrl },
+      title: `${exam?.title ?? 'All exams'} · ${classRoom || 'All classes'}`,
+      subtitle: `Showing ${attemptLabel}. Final scores include proctoring penalties.`,
+      rows: selected.map((session) => ({
+        fullName: toTitleCaseWords(session.student?.fullName ?? ''),
+        classRoom: session.student?.classRoom ?? '',
+        examTitle: session.examTitle,
+        trialNumber: session.trialNumber ?? 1,
+        correctCount: session.summary?.correctCount ?? 0,
+        totalQuestions: session.summary?.totalQuestions ?? 0,
+        penaltyPoints: session.summary?.penaltyPoints ?? 0,
+        finalPercent: session.summary?.finalPercent ?? 0,
+      })),
+      generatedAt: Date.now(),
+      timeZone: APP_TIMEZONE || undefined,
+    })
+  );
+});
+
 app.get('/api/admin/students', requireAdmin, async (req, res) => {
   const search = normalizeName(req.query?.search ?? '').toLowerCase();
   const classRoom = normalizeName(req.query?.classRoom ?? '');
   const examIdFilter = normalizeExamId(req.query?.examId ?? '');
 
-  const sessions = await getLatestSessions();
+  const sessions = await loadSessionList();
   const grouped = new Map();
 
   for (const session of sessions) {
@@ -3053,8 +3729,8 @@ app.get('/api/admin/students/:studentKey/trials', requireAdmin, async (req, res)
     return;
   }
 
-  const sessions = await getLatestSessions();
-  const trials = sessions
+  const storedTrials = await listSessions({ filter: { studentKey } });
+  const trials = (await Promise.all(storedTrials.map((session) => normalizeSession(session))))
     .filter((session) => (session.studentKey ?? '') === studentKey)
     .sort((left, right) => right.startedAt - left.startedAt);
 
@@ -3080,6 +3756,9 @@ app.get('/api/admin/students/:studentKey/trials', requireAdmin, async (req, res)
     violations: trial.violations ?? [],
     feedback: trial.feedback ?? null,
     questionReview: buildQuestionReview(trial),
+    setup: trial.setup ?? null,
+    hintsUsed: Object.keys(trial.hintsUsed ?? {}).length,
+    hintLimit: Number(trial.hintLimit) || 0,
   }));
 
   res.setHeader('Cache-Control', 'no-store');
@@ -3105,9 +3784,18 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
 
   const [users, sessions, helpRequests] = await Promise.all([
     listUsers(),
-    getLatestSessions(),
+    loadSessionList(),
     listPasswordAssistanceRequests(),
   ]);
+  const sessionsByUserId = new Map();
+  const sessionsByUserKey = new Map();
+  for (const session of sessions) {
+    if (session.userId) {
+      sessionsByUserId.set(session.userId, [...(sessionsByUserId.get(session.userId) ?? []), session]);
+    } else if (session.userKey) {
+      sessionsByUserKey.set(session.userKey, [...(sessionsByUserKey.get(session.userKey) ?? []), session]);
+    }
+  }
   const openHelpByUserKey = new Map();
   for (const request of helpRequests) {
     if (request.status === 'resolved') {
@@ -3119,7 +3807,10 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
 
   const rows = users
     .map((user) => {
-      const ownedSessions = sessions.filter((session) => studentOwnsSession(user, session));
+      const ownedSessions = [
+        ...(sessionsByUserId.get(user.id) ?? []),
+        ...(sessionsByUserKey.get(user.userKey) ?? []),
+      ];
       const submitted = ownedSessions.filter((session) => session.submittedAt);
       const bestFinalPercent = submitted.length
         ? Math.max(...submitted.map((session) => Number(session.summary?.finalPercent ?? 0)))
@@ -3182,13 +3873,14 @@ app.patch('/api/admin/users/:userId', requireAdmin, async (req, res) => {
   }
 
   const patch = {};
-  if (req.body?.fullName !== undefined) {
-    const fullName = normalizeName(req.body.fullName);
-    if (fullName.length < 5) {
-      res.status(400).json({ error: 'Full name must be at least 5 characters.' });
+  if (req.body?.firstName !== undefined || req.body?.lastName !== undefined || req.body?.fullName !== undefined) {
+    const names = readNameParts(req.body);
+    const nameError = validateNameParts(names);
+    if (nameError) {
+      res.status(400).json({ error: nameError.replace(/your /g, 'the ') });
       return;
     }
-    patch.fullName = fullName;
+    Object.assign(patch, names);
   }
   if (req.body?.classRoom !== undefined) {
     const classRoom = normalizeName(req.body.classRoom);
@@ -3261,13 +3953,15 @@ app.post('/api/admin/users/:userId/password', requireAdmin, async (req, res) => 
     return;
   }
 
-  const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+  // Resets go back to the starting password unless the teacher types a different one.
+  const newPassword =
+    typeof req.body?.newPassword === 'string' && req.body.newPassword ? req.body.newPassword : DEFAULT_STUDENT_PASSWORD;
   if (newPassword.length < 4) {
     res.status(400).json({ error: 'New password must be at least 4 characters.' });
     return;
   }
 
-  const nextHash = hashPasswordScrypt(newPassword);
+  const nextHash = await hashPasswordScryptAsync(newPassword);
   const updated = await updateUserPassword(user.id, nextHash, {
     mustChangePassword: req.body?.mustChangePassword !== false,
   });
@@ -3328,11 +4022,12 @@ app.patch('/api/admin/password-help/:requestId/resolve', requireAdmin, async (re
 });
 
 app.get('/api/admin/exams', requireAdmin, async (_req, res) => {
-  const [exams, questionPool, questionMap] = await Promise.all([
+  const [exams, questionPool, sessionCounts] = await Promise.all([
     listExams(),
     getQuestionPool(),
-    getQuestionByIdMap(),
+    countSessionsByExam(),
   ]);
+  const questionMap = new Map(questionPool.map((question) => [question.id, question]));
 
   const rows = exams.map((exam) => {
     const availableQuestionCount = pickExamQuestionSet(exam, questionPool, questionMap).length;
@@ -3340,6 +4035,7 @@ app.get('/api/admin/exams', requireAdmin, async (_req, res) => {
       ...toPublicExam(exam),
       availableQuestionCount,
       isReady: availableQuestionCount >= exam.questionCount,
+      sessionCount: sessionCounts.get(exam.id) ?? 0,
     };
   });
 
@@ -3357,11 +4053,8 @@ app.get('/api/admin/exams/:examId', requireAdmin, async (req, res) => {
     return;
   }
 
-  const [exam, questionPool, questionMap] = await Promise.all([
-    getExam(examId),
-    getQuestionPool(),
-    getQuestionByIdMap(),
-  ]);
+  const [exam, questionPool] = await Promise.all([getExam(examId), getQuestionPool()]);
+  const questionMap = new Map(questionPool.map((question) => [question.id, question]));
 
   if (!exam) {
     res.status(404).json({ error: 'Exam not found.' });
@@ -3406,6 +4099,10 @@ app.post('/api/admin/exams', requireAdmin, async (req, res) => {
       maxAttempts: req.body?.maxAttempts,
       allowedClasses: req.body?.allowedClasses,
       published: req.body?.published,
+      archived: req.body?.archived,
+      hintsAllowed: req.body?.hintsAllowed,
+      hintClasses: req.body?.hintClasses,
+      hintNote: req.body?.hintNote,
       proctoring: req.body?.proctoring,
       isDefault: false,
     });
@@ -3459,6 +4156,11 @@ app.patch('/api/admin/exams/:examId', requireAdmin, async (req, res) => {
   if (req.body?.published !== undefined) {
     patch.published = req.body.published;
   }
+  for (const key of ['archived', 'hintsAllowed', 'hintClasses', 'hintNote']) {
+    if (req.body?.[key] !== undefined) {
+      patch[key] = req.body[key];
+    }
+  }
   if (req.body?.durationSeconds !== undefined) {
     patch.durationSeconds = req.body.durationSeconds;
   }
@@ -3474,7 +4176,8 @@ app.patch('/api/admin/exams/:examId', requireAdmin, async (req, res) => {
 
   try {
     const updated = await updateExam(examId, patch);
-    const [questionPool, questionMap] = await Promise.all([getQuestionPool(), getQuestionByIdMap()]);
+    const questionPool = await getQuestionPool();
+    const questionMap = new Map(questionPool.map((question) => [question.id, question]));
     const availableQuestionCount = pickExamQuestionSet(updated, questionPool, questionMap).length;
 
     res.json({
@@ -3488,6 +4191,40 @@ app.patch('/api/admin/exams/:examId', requireAdmin, async (req, res) => {
   } catch (error) {
     res.status(400).json({ error: error.message || 'Could not update exam.' });
   }
+});
+
+app.delete('/api/admin/exams/:examId', requireAdmin, async (req, res) => {
+  const examId = normalizeExamId(req.params.examId);
+  if (!examId) {
+    res.status(400).json({ error: 'Invalid exam ID.' });
+    return;
+  }
+
+  if (examId === 'general') {
+    res.status(400).json({ error: 'The general exam pool cannot be deleted. Unpublish it instead.' });
+    return;
+  }
+
+  const exam = await getExam(examId);
+  if (!exam) {
+    res.status(404).json({ error: 'Exam not found.' });
+    return;
+  }
+
+  // Attempts reference their exam, so an exam with results is never deleted: unpublishing hides
+  // it from students while keeping every result and report card intact.
+  const attempts = await countSessions({ examId });
+  if (attempts > 0) {
+    res.status(409).json({
+      error: `This exam has ${attempts} recorded attempt(s). Unpublish it instead so results stay intact.`,
+      code: 'EXAM_HAS_ATTEMPTS',
+    });
+    return;
+  }
+
+  await deleteExam(examId);
+  const deletedQuestions = await deleteQuestionsBySourceExam(examId);
+  res.json({ ok: true, deletedQuestions });
 });
 
 app.get('/api/admin/questions', requireAdmin, async (_req, res) => {
@@ -3508,25 +4245,73 @@ app.get('/api/admin/questions', requireAdmin, async (_req, res) => {
 
 app.post('/api/admin/questions', requireAdmin, async (req, res) => {
   try {
-    const created = await addQuestion(req.body ?? {});
-    const questionPool = await getQuestionPool();
+    const sourceExamId = normalizeExamId(req.body?.sourceExamId) || 'general';
+    const exam = await getExam(sourceExamId);
+    if (!exam) {
+      res.status(400).json({ error: 'Choose an existing exam for this question.' });
+      return;
+    }
+
+    const created = await addQuestion({ ...(req.body ?? {}), sourceExamId: exam.id });
+    // Custom exams serve a fixed list of question IDs, so the new question must be added to it.
+    if (exam.mode === 'fixed') {
+      await attachExamQuestionIds(exam.id, [created.id]);
+    }
 
     res.status(201).json({
       ok: true,
       question: questionToAdminRow(created),
-      questionCount: questionPool.length,
+      questionCount: await getQuestionPoolCount(),
     });
   } catch (error) {
     res.status(400).json({ error: error.message || 'Invalid question payload.' });
   }
 });
 
+app.patch('/api/admin/questions/:questionId', requireAdmin, async (req, res) => {
+  // A question's ID and owning exam are fixed; everything else can be edited. Exams already
+  // taken keep their own snapshot, so edits only affect new attempts.
+  const { id: _ignoredId, sourceExamId: _ignoredSourceExamId, ...payload } = req.body ?? {};
+  try {
+    const updated = await updateQuestion(req.params.questionId, payload);
+    if (!updated) {
+      res.status(404).json({ error: 'Question not found.' });
+      return;
+    }
+
+    res.json({ ok: true, question: questionToAdminRow(updated) });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Invalid question payload.' });
+  }
+});
+
+app.delete('/api/admin/questions/:questionId', requireAdmin, async (req, res) => {
+  const question = await getQuestion(req.params.questionId);
+  if (!question) {
+    res.status(404).json({ error: 'Question not found.' });
+    return;
+  }
+
+  const blockingExams = await findExamsOnlyUsingQuestion(question.id);
+  if (blockingExams.length > 0) {
+    res.status(409).json({
+      error: `This is the only question in "${blockingExams[0].title}". Add another question to that exam first, or delete the exam.`,
+    });
+    return;
+  }
+
+  await removeQuestionFromExams(question.id);
+  await deleteQuestion(question.id);
+  res.json({ ok: true, questionCount: await getQuestionPoolCount() });
+});
+
 app.get('/api/admin/export/sessions.csv', requireAdmin, async (_req, res) => {
-  const sessions = await getLatestSessions();
+  const sessions = await loadSessionList();
 
   const rows = sessions
     .map((session) => {
-      const summary = session.summary ?? evaluateSession(session);
+      // In-progress attempts have no score yet: leave score columns blank rather than show 0.
+      const summary = session.submittedAt ? session.summary ?? {} : {};
       return {
         sessionId: session.id,
         examId: session.examId ?? 'general',
@@ -3539,14 +4324,14 @@ app.get('/api/admin/export/sessions.csv', requireAdmin, async (_req, res) => {
         status: sessionStatus(session),
         startedAtIso: new Date(session.startedAt).toISOString(),
         submittedAtIso: session.submittedAt ? new Date(session.submittedAt).toISOString() : '',
-        answeredCount: summary.answeredCount,
-        correctCount: summary.correctCount,
-        rawPercent: summary.rawPercent,
-        penaltyPoints: summary.penaltyPoints,
-        finalPercent: summary.finalPercent,
-        violationsCount: summary.violationsCount,
-        totalViolationsCount: summary.totalViolationsCount,
-        waivedViolationsCount: summary.waivedViolationsCount,
+        answeredCount: summary.answeredCount ?? countAnsweredQuestions(session),
+        correctCount: summary.correctCount ?? '',
+        rawPercent: summary.rawPercent ?? '',
+        penaltyPoints: summary.penaltyPoints ?? '',
+        finalPercent: summary.finalPercent ?? '',
+        violationsCount: summary.violationsCount ?? getActiveViolations(session).length,
+        totalViolationsCount: summary.totalViolationsCount ?? (session.violations ?? []).length,
+        waivedViolationsCount: summary.waivedViolationsCount ?? getWaivedViolations(session).length,
         feedbackRating: session.feedback?.rating ?? '',
         feedbackComment: session.feedback?.comment ?? '',
         feedbackSubmittedAtIso: session.feedback?.submittedAt
@@ -3564,7 +4349,7 @@ app.get('/api/admin/export/sessions.csv', requireAdmin, async (_req, res) => {
 });
 
 app.get('/api/admin/export/sessions.json', requireAdmin, async (_req, res) => {
-  const sessions = await getLatestSessions();
+  const sessions = await loadSessionList();
 
   const payload = sessions
     .map((session) => ({
@@ -3581,24 +4366,6 @@ app.get('/api/admin/export/sessions.json', requireAdmin, async (_req, res) => {
   res.json(payload);
 });
 
-app.get('/api/admin/export/emails.csv', requireAdmin, async (_req, res) => {
-  const sessions = await getLatestSessions();
-
-  const uniqueEmails = [...new Set(
-    sessions
-      .map((session) => normalizeEmail(session.student?.email ?? ''))
-      .filter((email) => isValidEmail(email))
-  )];
-
-  const rows = uniqueEmails
-    .sort((left, right) => left.localeCompare(right))
-    .map((email) => ({ email }));
-
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', 'attachment; filename="emails-only-export.csv"');
-  res.send(toCsv(rows));
-});
-
 app.get('/api/admin/export/questions.csv', requireAdmin, async (_req, res) => {
   const questionPool = await getQuestionPool();
 
@@ -3606,13 +4373,17 @@ app.get('/api/admin/export/questions.csv', requireAdmin, async (_req, res) => {
     id: question.id,
     sourceExamId: question.sourceExamId ?? 'general',
     topic: question.topic,
-    type: question.type,
     text: question.text,
-    optionA: question.options[0]?.text ?? '',
-    optionB: question.options[1]?.text ?? '',
-    optionC: question.options[2]?.text ?? '',
-    optionD: question.options[3]?.text ?? '',
-    correctOptionIds: question.correctOptionIds.join('|'),
+    type: questionTypeLabel(question),
+    optionA: question.options?.[0]?.text ?? '',
+    optionB: question.options?.[1]?.text ?? '',
+    optionC: question.options?.[2]?.text ?? '',
+    optionD: question.options?.[3]?.text ?? '',
+    correctOptionIds: (question.correctOptionIds ?? []).join('|'),
+    correctAnswer: describeCorrectAnswer(
+      question.type === 'order' ? { ...question, correctOrder: (question.items ?? []).map((item) => item.id) } : question
+    ),
+    explanation: question.explanation ?? '',
   }));
 
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -3627,29 +4398,77 @@ app.get('/api/admin/export/questions.json', requireAdmin, async (_req, res) => {
   res.json(questionPool);
 });
 
+// Unknown API routes get a JSON 404 instead of falling through to the SPA's index.html.
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'Not found.' });
+});
+
 app.use((error, req, res, next) => {
-  console.error(
-    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} failed:`,
-    error?.stack || error?.message || error
-  );
+  // Malformed JSON bodies and oversized payloads arrive here with a 4xx status from body-parser.
+  const status = Number.isInteger(error?.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
+  if (status >= 500) {
+    console.error(
+      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} failed:`,
+      error?.stack || error?.message || error
+    );
+  }
 
   if (res.headersSent) {
     next(error);
     return;
   }
 
-  const status = Number.isInteger(error?.status) && error.status >= 400 ? error.status : 500;
   const message =
-    status === 500
+    status >= 500
       ? 'Internal server error. Please retry.'
-      : error?.message || 'Request failed.';
+      : error?.type === 'entity.too.large'
+        ? 'Request is too large.'
+        : error?.expose && error?.message
+          ? error.message
+          : 'Request failed.';
 
   res.status(status).json({ error: message });
 });
 
 const distPath = path.resolve(process.cwd(), 'dist');
 if (existsSync(distPath)) {
-  app.use(express.static(distPath));
+  // Vite fingerprints everything under /assets, so those files can be cached for a year.
+  // index.html must always be revalidated so a new deploy is picked up immediately.
+  app.use(
+    '/assets',
+    express.static(path.join(distPath, 'assets'), { immutable: true, maxAge: '1y', fallthrough: false })
+  );
+  // The Python runtime is ~13 MB; the build stores brotli/gzip copies so each student downloads
+  // about a third of that, without spending server CPU on compression.
+  const pyodidePath = path.join(distPath, 'pyodide');
+  app.use(
+    '/pyodide',
+    (req, res, next) => {
+      const relative = path.normalize(decodeURIComponent(req.path));
+      if (relative.includes('..')) {
+        next();
+        return;
+      }
+      const file = path.join(pyodidePath, relative);
+      const accepted = String(req.headers['accept-encoding'] ?? '');
+      for (const [encoding, extension] of [
+        ['br', '.br'],
+        ['gzip', '.gz'],
+      ]) {
+        if (accepted.includes(encoding) && existsSync(`${file}${extension}`)) {
+          res.type(path.extname(file));
+          res.setHeader('Content-Encoding', encoding);
+          res.setHeader('Vary', 'Accept-Encoding');
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          res.sendFile(`${file}${extension}`);
+          return;
+        }
+      }
+      next();
+    },
+    express.static(pyodidePath, { immutable: true, maxAge: '1y', fallthrough: false })
+  );
+  app.use(express.static(distPath, { index: false, maxAge: '1h' }));
 
   app.get('/{*splat}', (req, res, next) => {
     if (req.path.startsWith('/api/')) {
@@ -3657,14 +4476,105 @@ if (existsSync(distPath)) {
       return;
     }
 
+    res.setHeader('Cache-Control', 'no-cache');
     res.sendFile(path.join(distPath, 'index.html'));
   });
+} else if (IS_PRODUCTION) {
+  console.warn('dist/ not found: run "npm run build" so the server can serve the frontend.');
 }
 
-app.listen(PORT, () => {
-  console.log(`Salem Exam API running on http://localhost:${PORT}`);
-  if (!parsedAdminPasscodeHash) {
-    console.warn('ADMIN_PASSCODE_HASH is not configured. Admin login is disabled until it is set.');
+/**
+ * First start after this release: adds the current exam with its 40 questions and marks the old
+ * general pool as an archived practice exam. Runs once (a settings flag records it), so later
+ * edits or deletions made in the admin dashboard are never overwritten.
+ */
+async function ensureCurrentExamSeeded() {
+  const settings = (await getDb()).collection('settings');
+  if (await settings.findOne({ key: CURRENT_EXAM_SEED_KEY })) {
+    return;
   }
-  startKeepAliveLoop();
-});
+
+  if (!(await getExam(CURRENT_EXAM_ID))) {
+    const exam = await createExam({
+      ...CURRENT_EXAM,
+      mode: 'pool',
+      questionCount: CURRENT_EXAM_QUESTIONS.length,
+      allowedClasses: CLASS_OPTIONS,
+    });
+    const created = [];
+    for (const question of CURRENT_EXAM_QUESTIONS) {
+      created.push(await addQuestion({ ...question, sourceExamId: exam.id }));
+    }
+    await updateExam(exam.id, {
+      mode: 'fixed',
+      questionIds: created.map((question) => question.id),
+      questionCount: created.length,
+    });
+    console.log(`Seeded exam "${CURRENT_EXAM.title}" with ${created.length} questions.`);
+  }
+
+  const general = await getExam('general');
+  if (general && !general.archived) {
+    await updateExam('general', {
+      archived: true,
+      title: general.title === 'General Exam Pool' ? 'Computer Basics (Archived)' : general.title,
+      description: 'An older practice exam on computer basics. Try it in your spare time; it is not the current exam.',
+      allowedClasses: CLASS_OPTIONS,
+    });
+  }
+
+  await settings.updateOne(
+    { key: CURRENT_EXAM_SEED_KEY },
+    { $set: { key: CURRENT_EXAM_SEED_KEY, value: { seededAt: Date.now() }, updatedAt: Date.now() } },
+    { upsert: true }
+  );
+}
+
+async function startServer() {
+  if (!String(process.env.MONGO_URI ?? '').trim()) {
+    console.error('MONGO_URI is not set. Copy .env.example to .env and fill it in.');
+    process.exit(1);
+  }
+
+  try {
+    const db = await getDb();
+    await db.command({ ping: 1 });
+    // Build indexes before accepting traffic so the first exam rush doesn't pay for it.
+    await Promise.all([initSessionStore(), initUserStore(), listExams(), getQuestionPoolCount()]);
+    await ensureCurrentExamSeeded();
+  } catch (error) {
+    console.error(`Could not connect to MongoDB: ${error?.message ?? error}`);
+    process.exit(1);
+  }
+
+  const server = app.listen(PORT, () => {
+    console.log(`Salem Exam API running on http://localhost:${PORT}`);
+    if (!parsedAdminPasscodeHash) {
+      console.warn('ADMIN_PASSCODE_HASH is not configured. Admin login is disabled until it is set.');
+    }
+    if (IS_PRODUCTION && !TRUST_PROXY) {
+      console.warn('TRUST_PROXY is not set. Behind a reverse proxy, set it so rate limits see real client IPs.');
+    }
+    startKeepAliveLoop();
+  });
+
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    console.log(`${signal} received: finishing in-flight requests, then exiting.`);
+    const forceExit = setTimeout(() => process.exit(1), 10_000);
+    forceExit.unref();
+    server.close(async () => {
+      await closeDb().catch(() => undefined);
+      process.exit(0);
+    });
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+void startServer();

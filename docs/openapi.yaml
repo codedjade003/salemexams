@@ -22,12 +22,19 @@ paths:
                 email: { type: string, format: email }
                 username: { type: string, description: "3-32 chars: a-z, 0-9, dot, underscore, hyphen" }
                 password: { type: string, minLength: 4 }
+                registrationCode:
+                  type: string
+                  description: Required only when the server sets REGISTRATION_CODE (see `registrationRequiresCode` in /api/exam/meta).
               description: Provide at least one of `email` or `username`.
       responses:
         '201':
           description: Registered and logged in
+        '403':
+          description: Wrong school access code (code REGISTRATION_CODE_INVALID)
         '409':
           description: Email/details already exist
+        '429':
+          description: Too many sign-ups from this network
 
   /api/student/login:
     post:
@@ -51,6 +58,17 @@ paths:
           description: Invalid password
         '404':
           description: Account not found
+        '429':
+          description: Too many failed attempts for this account (Retry-After header set)
+
+  /api/student/logout:
+    post:
+      summary: Revoke the current student token
+      security:
+        - studentBearer: []
+      responses:
+        '200':
+          description: Signed out
 
   /api/student/me:
     get:
@@ -143,6 +161,91 @@ paths:
       responses:
         '200':
           description: Admin token
+        '401':
+          description: Invalid passcode
+        '429':
+          description: Too many failed attempts (Retry-After header set)
+
+  /api/admin/logout:
+    post:
+      summary: Revoke the current admin token
+      security:
+        - adminBearer: []
+      responses:
+        '200':
+          description: Signed out
+
+  /api/admin/exams/{examId}:
+    delete:
+      summary: Delete an exam and the questions written for it
+      description: Refused with 409 when the exam has recorded attempts (unpublish it instead). The general pool cannot be deleted.
+      security:
+        - adminBearer: []
+      parameters:
+        - in: path
+          name: examId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Deleted
+        '400':
+          description: The general exam pool cannot be deleted
+        '409':
+          description: Exam has attempts (code EXAM_HAS_ATTEMPTS)
+
+  /api/admin/questions:
+    post:
+      summary: Add a question to an exam
+      description: Questions for a custom (fixed) exam are also added to that exam's question list.
+      security:
+        - adminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionInput'
+      responses:
+        '201':
+          description: Created
+
+  /api/admin/questions/{questionId}:
+    patch:
+      summary: Edit a question (ID and owning exam are fixed; past attempts keep their snapshot)
+      security:
+        - adminBearer: []
+      parameters:
+        - in: path
+          name: questionId
+          required: true
+          schema: { type: string, example: Q041 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionInput'
+      responses:
+        '200':
+          description: Updated
+        '404':
+          description: Not found
+    delete:
+      summary: Delete a question
+      description: Refused with 409 if it is the only question in a custom exam.
+      security:
+        - adminBearer: []
+      parameters:
+        - in: path
+          name: questionId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Deleted
+        '409':
+          description: Last question of an exam
 
   /api/admin/settings/branding:
     get:
@@ -186,6 +289,22 @@ paths:
             text/html: {}
 
 components:
+  schemas:
+    QuestionInput:
+      type: object
+      properties:
+        sourceExamId: { type: string, description: 'Exam the question belongs to (POST only). Defaults to "general".' }
+        topic: { type: string }
+        type: { type: string, enum: [single, multi] }
+        text: { type: string, minLength: 5 }
+        optionTexts:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items: { type: string }
+        correctOptionIds:
+          type: array
+          items: { type: string, enum: [A, B, C, D] }
   securitySchemes:
     studentBearer:
       type: http

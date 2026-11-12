@@ -1,140 +1,110 @@
-# Salem Academy CBT Exam App
+# Salem Academy CBT
 
-React + Vite CBT frontend with an Express + MongoDB backend and an admin dashboard.
+Computer-based testing for Salem Academy: a student exam portal and an admin dashboard, served by
+one Node.js process backed by MongoDB.
 
-## Current Auth Flow
+- **Students** (`/`): sign up with a username, run through a device check and practice test, take
+  timed exams (multiple choice, ordering, flowcharts, debugging, writing Python), see their score
+  immediately and corrections with explanations after a release delay, and dispute violations.
+- **Admins** (`/admin`): monitor live attempts, review answers and overrule marks, decide disputes,
+  print report cards in bulk, manage accounts, build exams and every question type, export results.
 
-- Student registration: full name, class, password, and at least one of email/username
-- Student login: email or username + password
-- Student token + admin token are persisted in MongoDB (survive server restarts)
-- Frontend auto-logs out when token/session expires
-- Student UI also auto-logs out after idle timeout on non-exam screens (default 3 minutes, configurable with `VITE_STUDENT_IDLE_TIMEOUT_MS`)
+## Stack
 
-## Features
+- Frontend: React 19 + Vite, plain CSS design system (`src/styles`), Inter (bundled), Lucide icons
+- Backend: Express 5, Helmet, MongoDB driver 7
+- Node.js 20 or newer
 
-- Student dashboard (exam start/resume, previous trials, class + overall leaderboard)
-- General dashboard feedback from students
-- Timed exam sessions with autosubmit
-- Proctoring events + violation penalty model
-- Result page with score summary
-- Review flow:
-  - selected answers shown immediately after submit
-  - correct answers shown after release time
-- Student and admin report card download (HTML export)
-- Admin branding settings (school name + logo URL for report cards)
-- Admin management:
-  - sessions, users, password resets, exams, questions
-  - exports and analytics
+## Project layout
 
-## Tech Stack
-
-- Frontend: React + Vite
-- Backend: Express + Helmet + CORS
-- Database: MongoDB
-
-## Environment
-
-Use `.env.example` as reference.
-
-Required:
-
-- `MONGO_URI`
-- `MONGO_DB_NAME`
-- `ADMIN_PASSCODE_HASH`
-
-Optional:
-
-- `PORT` (default `4000`)
-- `RESULT_RELEASE_DELAY_MS` (default `1500000`, 25 minutes)
-- `KEEP_ALIVE_ENABLED`, `KEEP_ALIVE_URL`, `KEEP_ALIVE_INTERVAL_MS`
-
-Generate admin hash:
-
-```bash
-npm run hash:admin -- "your-strong-passcode"
+```
+server/
+  index.js          API routes, session logic, server bootstrap
+  store.js          exam attempts (sessions), revision-checked writes
+  examStore.js      exams (cached)              questionStore.js  question bank (cached)
+  userStore.js      student accounts            *TokenStore.js    auth tokens (TTL indexes)
+  rateLimit.js      login / sign-up rate limits reportCard.js     downloadable report card HTML
+src/
+  student/          student portal (StudentApp.jsx holds the exam logic; the rest is UI)
+  admin/            admin dashboard (AdminApp.jsx shell + one file per page in pages/)
+  components/ui.jsx shared components           styles/           design tokens and CSS
+scripts/
+  smoke-e2e.mjs     end-to-end test against a temporary database
+  audit-sessions.mjs  one-off data audit / repair for old attempt records
+  hash-admin-password.mjs
 ```
 
-## Run Locally
+## Configuration
 
-Install:
+Copy `.env.example` to `.env` and fill it in. Required:
+
+| Variable | Purpose |
+|---|---|
+| `MONGO_URI`, `MONGO_DB_NAME` | Database connection |
+| `ADMIN_PASSCODE_HASH` | Admin passcode hash. Generate with `npm run hash:admin -- "your-passcode"` |
+
+Recommended: `NODE_ENV=production` and `APP_TIMEZONE=Africa/Lagos` (dates on report cards).
+
+Optional: `DEFAULT_STUDENT_PASSWORD` (`salem`), `DEFAULT_MAX_ATTEMPTS` (3), `RESULT_RELEASE_DELAY_MS`
+(25 min), `SUBMIT_GRACE_MS` (90 s), `CORS_ORIGINS` and `VITE_API_BASE` (only if the frontend is hosted on
+a different domain from the API), `VITE_STUDENT_IDLE_TIMEOUT_MS`, `MONGO_DNS_SERVERS`.
+
+## Development
 
 ```bash
 npm install
+npm run dev          # student app http://localhost:5173, admin http://localhost:5173/admin
+npm run lint
+npm run test:smoke   # needs MONGO_URI; creates and drops a throwaway database
+npm run test:load    # 40 simulated students take the exam at once; verifies every stored answer
 ```
 
-Development:
+## Deploying on Render
 
-```bash
-npm run dev
-```
+One **Web Service** serves both the API and the built frontend:
 
-- Student app: `http://localhost:5173`
-- Admin app: `http://localhost:5173/admin`
+| Setting | Value |
+|---|---|
+| Build command | `npm install && npm run build` |
+| Start command | `npm start` |
+| Health check path | `/api/health` |
+| Environment | `MONGO_URI`, `MONGO_DB_NAME`, `ADMIN_PASSCODE_HASH`, `NODE_ENV=production`, `APP_TIMEZONE=Africa/Lagos` |
 
-Production-style run:
+On Render the server detects its public URL, trusts the proxy for rate limiting, and pings itself so a
+free instance does not go to sleep during an exam. The build copies the in-browser Python runtime
+(Pyodide) into the site and pre-compresses it. On first start the server adds the current exam
+("Algorithms, Flowcharts & Python Basics", 40 questions) and marks the old pool as an archived
+practice exam; after that everything is edited from the admin dashboard and never overwritten.
 
-```bash
-npm run build
-npm run start
-```
+For an exam with about 40 students, use at least the Starter instance: the free instance has a
+fraction of a CPU, which makes the sign-in rush slow (password hashing is deliberately expensive).
 
-## Smoke Test
+## How exams stay safe
 
-End-to-end smoke test (local server + temporary DB):
+- **Answers.** Each answer is stored in the browser and sent to the server until it is confirmed;
+  it survives a dropped connection, a refresh, or being signed out. Submitting carries any
+  unconfirmed answers with it, and the server accepts late arrivals for 90 seconds after 00:00.
+- **Resuming.** Signing in again (on any computer) reopens a running exam where it stopped. The
+  timer keeps running.
+- **Supervision.** Leaving the exam counts once per absence, with how long the student was away.
+  Focus losses under 2 seconds are logged but cost nothing. Students can dispute a violation after
+  submitting; the teacher accepts or rejects it under **Violation disputes**.
+- **Python.** Programs run in the student's browser. The coding question is checked there against
+  the question's tests; the teacher can overrule any mark when reviewing an attempt.
+- **Hints.** Every question can have a hint. An exam sets how many hints a student gets and for
+  which classes (none by default).
 
-```bash
-npm run test:smoke
-```
+## Security notes
 
-The smoke script covers:
+- Passwords and the admin passcode are hashed with scrypt (run off the main thread).
+- Tokens are random, stored server-side with expiry, and revoked on sign-out, password change,
+  password reset, and account disable.
+- Failed logins are rate limited per account and per network; sign-ups and help requests per
+  network. Limits are generous because a school lab shares one public IP.
+- Scores are never revealed for an exam in progress. Correct answers stay hidden until the
+  release time.
+- CSV exports neutralize spreadsheet formulas in student-entered text.
 
-- register/login/change-password
-- token persistence after restart
-- exam flow (start, seen, answer, flag, proctor, submit, feedback)
-- student report card endpoint
-- admin login + branding + report card
-- admin password reset flow
+## API
 
-## API (Key Endpoints)
-
-Student auth/profile:
-
-- `POST /api/student/register`
-- `POST /api/student/login`
-- `GET /api/student/me`
-- `POST /api/student/change-password`
-- `POST /api/student/password-help`
-- `POST /api/student/feedback` (general dashboard feedback)
-
-Student exam:
-
-- `GET /api/exam/meta`
-- `POST /api/exam/start`
-- `GET /api/exam/:sessionId`
-- `POST /api/exam/:sessionId/seen`
-- `POST /api/exam/:sessionId/answer`
-- `POST /api/exam/:sessionId/flag`
-- `POST /api/exam/:sessionId/proctor`
-- `POST /api/exam/:sessionId/submit`
-- `POST /api/exam/:sessionId/feedback`
-- `GET /api/student/trials/:sessionId/report-card`
-
-Admin:
-
-- `POST /api/admin/login`
-- `GET /api/admin/overview`
-- `GET /api/admin/sessions`
-- `GET /api/admin/sessions/:sessionId`
-- `GET /api/admin/sessions/:sessionId/report-card`
-- `PATCH /api/admin/sessions/:sessionId/violations/waive`
-- `GET /api/admin/settings/branding`
-- `PATCH /api/admin/settings/branding`
-- `GET /api/admin/users`
-- `PATCH /api/admin/users/:userId`
-- `POST /api/admin/users/:userId/password`
-
-## OpenAPI/Swagger Spec
-
-- OpenAPI file: [docs/openapi.yaml](docs/openapi.yaml)
-
-If you want Swagger UI wired directly into the app, add a Swagger UI middleware route and serve this spec.
+Key endpoints are documented in [docs/openapi.yaml](docs/openapi.yaml).
