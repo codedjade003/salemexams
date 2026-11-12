@@ -343,6 +343,7 @@ export default function AttemptsPage() {
                   </td>
                   <td>
                     <span className="cell-primary">{row.studentName}</span>
+                    {row.isTest ? <span className="badge badge-gold you-tag">Test</span> : null}
                     <span className="cell-sub">
                       {row.classRoom} · {row.email || '—'}
                     </span>

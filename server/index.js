@@ -966,6 +966,7 @@ const LEADERBOARD_PROJECTION = Object.freeze({
   expiresAt: 1,
   submittedAt: 1,
   summary: 1,
+  isTest: 1,
 });
 let leaderboardCache = null;
 let leaderboardLoad = null;
@@ -985,7 +986,7 @@ async function getLeaderboardRows() {
     const generation = leaderboardGeneration;
     leaderboardLoad = (async () => {
       const sessions = await loadSessionList({}, LEADERBOARD_PROJECTION);
-      const rows = buildStudentLeaderboardRows(sessions);
+      const rows = buildStudentLeaderboardRows(sessions.filter((session) => !session.isTest));
       if (generation === leaderboardGeneration) {
         leaderboardCache = { rows, expiresAt: Date.now() + LEADERBOARD_CACHE_TTL_MS };
       }
@@ -1286,6 +1287,7 @@ function toSessionRow(session) {
 
   return {
     id: session.id,
+    isTest: Boolean(session.isTest),
     examId: session.examId ?? 'general',
     examTitle: session.examTitle ?? 'General Exam Pool',
     trialNumber: session.trialNumber ?? 1,
@@ -1887,7 +1889,8 @@ function buildExamAttemptStatsForUser(user, exams, sessions) {
       : 0;
     const maxAttempts = Number(exam.maxAttempts ?? 3);
     const attemptsUsed = trials.length;
-    const attemptsRemaining = Math.max(0, maxAttempts - attemptsUsed);
+    // Test students (admin test mode) can retake an exam as often as they like.
+    const attemptsRemaining = user.isTest ? maxAttempts : Math.max(0, maxAttempts - attemptsUsed);
     const canAttempt = attemptsRemaining > 0;
 
     return {
@@ -2623,7 +2626,7 @@ async function startExamForStudent(req, res) {
     return;
   }
 
-  if (attemptsRemaining <= 0) {
+  if (attemptsRemaining <= 0 && !user.isTest) {
     res.status(409).json({
       error: `Attempt limit reached for ${selectedExam.title}.`,
       attemptsUsed,
@@ -2682,6 +2685,7 @@ async function startExamForStudent(req, res) {
     summary: null,
     feedback: null,
     lastActivityAt: startedAt,
+    isTest: Boolean(user.isTest),
     setup: sanitizeSetupInfo(req.body?.setup),
     hintLimit: hintLimitFor(selectedExam, classRoom),
     hintsUsed: {},
@@ -3114,12 +3118,12 @@ app.patch('/api/admin/settings/branding', requireAdmin, async (req, res) => {
 });
 
 app.get('/api/admin/overview', requireAdmin, async (_req, res) => {
-  const [sessions, questionPool, generalFeedbackCount] = await Promise.all([
+  const [allSessions, questionPool, generalFeedbackCount] = await Promise.all([
     loadSessionList(),
     getQuestionPool(),
     countGeneralFeedback(),
   ]);
-  const overview = buildOverview(sessions, questionPool);
+  const overview = buildOverview(allSessions.filter((session) => !session.isTest), questionPool);
   overview.totals.generalFeedbackCount = generalFeedbackCount;
 
   res.setHeader('Cache-Control', 'no-store');
@@ -3369,6 +3373,56 @@ app.post('/api/admin/sessions/purge', requireAdmin, async (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------- admin test mode
+
+// Signs the admin in as a flagged test student of the chosen class, so they can walk through the
+// whole student flow. Test attempts are left out of leaderboards, statistics, exports and class
+// printing, have no attempt limit, and are removed with DELETE /api/admin/test-data.
+app.post('/api/admin/test-student', requireAdmin, async (req, res) => {
+  const requested = normalizeName(req.body?.classRoom);
+  const classRoom = CLASS_OPTIONS.includes(requested) ? requested : CLASS_OPTIONS[0];
+  const username = `test.${classRoom.replace(/\s+/g, '').toLowerCase()}`;
+
+  let user = await getUserByUsername(username);
+  if (user && !user.isTest) {
+    res.status(409).json({ error: `A real student already uses the username ${username}.` });
+    return;
+  }
+  if (!user) {
+    user = await createUserWithPassword(
+      { fullName: `Test Student (${classRoom})`, firstName: 'Test', lastName: 'Student', classRoom, username },
+      randomUUID(),
+      { mustChangePassword: false, isTest: true }
+    );
+  }
+
+  const tokenInfo = await issueStudentToken(user);
+  res.json({ ok: true, token: tokenInfo.token, expiresAt: tokenInfo.expiresAt, user: toPublicUserRecord(user) });
+});
+
+async function findTestData() {
+  const db = await getDb();
+  const users = await db.collection('users').find({ isTest: true }, { projection: { id: 1 } }).toArray();
+  const userIds = users.map((user) => user.id);
+  const sessionFilter = { $or: [{ isTest: true }, { userId: { $in: userIds } }] };
+  return { db, userIds, sessionFilter };
+}
+
+app.get('/api/admin/test-data', requireAdmin, async (_req, res) => {
+  const { db, userIds, sessionFilter } = await findTestData();
+  res.json({ ok: true, students: userIds.length, attempts: await db.collection('sessions').countDocuments(sessionFilter) });
+});
+
+app.delete('/api/admin/test-data', requireAdmin, async (_req, res) => {
+  const { db, userIds, sessionFilter } = await findTestData();
+  const attempts = await db.collection('sessions').deleteMany(sessionFilter);
+  await db.collection('student_tokens').deleteMany({ userId: { $in: userIds } });
+  await db.collection('student_general_feedback').deleteMany({ userId: { $in: userIds } });
+  const students = await db.collection('users').deleteMany({ isTest: true });
+  invalidateLeaderboardCache();
+  res.json({ ok: true, students: students.deletedCount ?? 0, attempts: attempts.deletedCount ?? 0 });
+});
+
 // ---------------------------------------------------------------- violation disputes
 
 const DISPUTE_REASONS = ['accident', 'not_me', 'other'];
@@ -3541,6 +3595,7 @@ async function selectSubmittedSessions(body) {
   const filter = ids.length ? { id: { $in: ids } } : {};
   let sessions = (await loadSessionList(filter)).filter((session) => session.submittedAt);
   if (!ids.length) {
+    sessions = sessions.filter((session) => !session.isTest);
     if (examId) sessions = sessions.filter((session) => (session.examId ?? 'general') === examId);
     if (classRoom) sessions = sessions.filter((session) => session.student?.classRoom === classRoom);
   }
@@ -4313,7 +4368,7 @@ app.delete('/api/admin/questions/:questionId', requireAdmin, async (req, res) =>
 });
 
 app.get('/api/admin/export/sessions.csv', requireAdmin, async (_req, res) => {
-  const sessions = await loadSessionList();
+  const sessions = (await loadSessionList()).filter((session) => !session.isTest);
 
   const rows = sessions
     .map((session) => {
@@ -4356,7 +4411,7 @@ app.get('/api/admin/export/sessions.csv', requireAdmin, async (_req, res) => {
 });
 
 app.get('/api/admin/export/sessions.json', requireAdmin, async (_req, res) => {
-  const sessions = await loadSessionList();
+  const sessions = (await loadSessionList()).filter((session) => !session.isTest);
 
   const payload = sessions
     .map((session) => ({

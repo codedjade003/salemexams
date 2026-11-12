@@ -468,6 +468,15 @@ export default function Dashboard(props) {
           </div>
         </section>
 
+        {user?.isTest ? (
+          <div style={{ marginBottom: '1.25rem' }}>
+            <Alert tone="warning" title="Test mode">
+              You are signed in as a test student from the admin dashboard. Nothing you do here counts towards results or the
+              leaderboard, you can retake exams freely, and it can all be deleted from Admin → Test mode.
+            </Alert>
+          </div>
+        ) : null}
+
         {user?.mustChangePassword ? (
           <div style={{ marginBottom: '1.25rem' }}>
             <Alert

@@ -149,6 +149,7 @@ function toPublicUser(user) {
     email: user.email,
     username: user.username ?? '',
     mustChangePassword: Boolean(user.mustChangePassword),
+    isTest: Boolean(user.isTest),
     disabled: Boolean(user.disabled),
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
@@ -265,6 +266,8 @@ export async function createUserWithPassword(payload, password, options = {}) {
     username: normalized.username,
     passwordHash: await hashPasswordScryptAsync(password),
     mustChangePassword: Boolean(options.mustChangePassword),
+    // Test students are created from the admin dashboard; their data never counts in results.
+    isTest: Boolean(options.isTest),
     disabled: false,
     createdAt: now,
     updatedAt: now,

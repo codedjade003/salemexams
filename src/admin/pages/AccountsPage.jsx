@@ -300,6 +300,7 @@ export default function AccountsPage() {
                 <tr key={user.id}>
                   <td>
                     <span className="cell-primary">{user.fullName}</span>
+                    {user.isTest ? <span className="badge badge-gold you-tag">Test</span> : null}
                     <span className="cell-sub">{contactLabel(user)}</span>
                   </td>
                   <td>{user.classRoom}</td>

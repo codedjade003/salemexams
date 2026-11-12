@@ -3,6 +3,7 @@ import {
   BookOpen,
   Download,
   ExternalLink,
+  FlaskConical,
   GraduationCap,
   LayoutDashboard,
   LifeBuoy,
@@ -32,6 +33,7 @@ import HelpRequestsPage from './pages/HelpRequestsPage';
 import OverviewPage from './pages/OverviewPage';
 import QuestionsPage from './pages/QuestionsPage';
 import SettingsPage from './pages/SettingsPage';
+import TestModePage from './pages/TestModePage';
 import StudentsPage from './pages/StudentsPage';
 
 const ADMIN_TOKEN_KEY = 'salem_admin_token';
@@ -64,6 +66,7 @@ const NAV = [
   {
     group: 'System',
     items: [
+      { id: 'test', label: 'Test mode', icon: FlaskConical, component: TestModePage },
       { id: 'exports', label: 'Exports', icon: Download, component: ExportsPage },
       { id: 'settings', label: 'Settings', icon: Settings, component: SettingsPage },
     ],

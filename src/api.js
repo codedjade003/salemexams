@@ -659,3 +659,20 @@ export async function downloadAdminPrintout(token, path, body, downloadName) {
   anchor.remove();
   URL.revokeObjectURL(objectUrl);
 }
+
+/** Admin test mode: a student token for a flagged test student in `classRoom`. */
+export function createAdminTestStudent(token, classRoom) {
+  return apiRequest('/api/admin/test-student', {
+    method: 'POST',
+    headers: withAdminHeaders(token),
+    body: JSON.stringify({ classRoom }),
+  });
+}
+
+export function fetchAdminTestData(token) {
+  return apiRequest('/api/admin/test-data', { headers: withAdminHeaders(token) });
+}
+
+export function deleteAdminTestData(token) {
+  return apiRequest('/api/admin/test-data', { method: 'DELETE', headers: withAdminHeaders(token) });
+}
